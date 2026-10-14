@@ -1,0 +1,33 @@
+Model Pack 0.1.0-beta — installation
+==================================
+
+Tested on Windows / Autodesk Maya 2027.
+Uses Maya's bundled Python, PySide6, shiboken6 and NumPy.
+
+1. Extract the entire ZIP to a permanent ASCII folder, such as C:/MayaTools.
+   Spaces in the path are supported.
+2. Open Maya and choose a Shelf tab.
+3. Drag install_model_pack.py from that folder into Maya's 3D viewport.
+4. An MP shelf button is created and the Model Pack panel opens.
+5. Choose Save All Shelves from the Shelf menu.
+
+Keep the extracted folder in place. The button stores its path.
+The installer also writes maya/modules/ModelPack.mod in your Maya user folder,
+so scripts and history nodes are available when Maya restarts.
+Maya cannot reliably find Python plug-ins in non-ASCII paths when reopening
+saved scenes. The installer checks this before writing files or a shelf button.
+
+If dragging fails, run this in Script Editor's Python tab with your own path:
+
+    import runpy
+    runpy.run_path(r'C:\MayaTools\ModelPack_0.1.0-beta\install_model_pack.py', run_name='__main__')
+
+To update, save your scene, close Maya and replace the full package.
+If its path changes, reinstall on the same Shelf tab and save your shelves.
+Reinstalling updates the existing MP button without creating a duplicate.
+
+To uninstall, remove MP and save the Shelf. Close Maya, remove ModelPack.mod
+from your Maya user modules folder, then remove the extracted package.
+Apply any Model Pack history you need before removing its files.
+
+Detailed tool instructions and troubleshooting are in README.md.
