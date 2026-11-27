@@ -52,7 +52,7 @@ def _create_progress_window(status):
             self.label=QtWidgets.QLabel(status,self);layout.addWidget(self.label)
             self.bar=QtWidgets.QProgressBar(self);self.bar.setRange(0,100)
             self.bar.setValue(0);layout.addWidget(self.bar)
-            self.cancel=QtWidgets.QPushButton('Отмена',self)
+            self.cancel=QtWidgets.QPushButton('Cancel',self)
             self.cancel.clicked.connect(self.reject);layout.addWidget(self.cancel)
             self.setMinimumWidth(330)
 
@@ -1030,6 +1030,43 @@ def detect(mesh, *, seeds=None, sensitivity="normal", include_corners=True, use_
     return result
 
 
+def _quad_network_groups(data, candidates):
+    """Find connected ribbons around a stronger turn, then prove the collapse."""
+    turn = math.cos(math.radians(30))
+    eligible = {}
+
+    def matches(face):
+        if face not in eligible:
+            eligible[face] = len(data.faces[face]) == 4 and any(
+                data.normals[face] * data.normals[other] < turn
+                for other in data.neighbors[face]
+            )
+        return eligible[face]
+
+    visited = set()
+    for face in candidates:
+        if face in visited or not matches(face):
+            continue
+        patch = [face]
+        visited.add(face)
+        for index, current in enumerate(patch):
+            if index % 64 == 0:
+                _checkpoint('Поиск соединённых фасок')
+            for other in data.neighbors[current]:
+                if other not in visited and matches(other):
+                    visited.add(other)
+                    patch.append(other)
+        if len(patch) < 3:
+            continue
+        details = {}
+        try:
+            unbevel_faces.prepare(data.mesh, patch, details=details, analysis=_analysis(data))
+        except ValueError:
+            continue
+        if any(region.get('quad_network') for region in details.get('regions', ())):
+            yield BevelGroup(data.mesh, tuple(sorted(patch)), 'geometry', True, '')
+
+
 def _detect_snapshot(data, *, seeds=None, sensitivity="normal", include_corners=True, use_history=True):
     mesh=data.mesh
     seeds = None if seeds is None else set(seeds)
@@ -1166,6 +1203,12 @@ def _detect_snapshot(data, *, seeds=None, sensitivity="normal", include_corners=
     if seeds:separated=[(p,s) for p,s in separated if p & seeds]
     groups = tuple(_group(data, patch, origin or (source if history is None or patch <= history[0]
                           else "geometry+history" if patch & history[0] else "geometry")) for patch,origin in separated)
+    if include_corners and not hasattr(data, 'source_faces'):
+        for network in _quad_network_groups(data, sorted(seeds) if seeds else range(len(data.faces))):
+            faces = set(network.faces)
+            if any(g.ready and faces.intersection(g.faces) and not faces.issuperset(g.faces) for g in groups):
+                continue
+            groups = tuple(g for g in groups if not faces.intersection(g.faces)) + (network,)
     memberships = defaultdict(set)
     for index, group in enumerate(groups):
         for vertex in {v for face in group.faces for v in data.faces[face]}:

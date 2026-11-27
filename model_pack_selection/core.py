@@ -1,7 +1,65 @@
 """Read-only topology operations for Model Pack Selection."""
 from collections import defaultdict,deque
+import heapq
 from maya.api import OpenMaya as om
 from slide_for_maya.core import _mesh_fn
+
+
+def shortest_path(fn,kind,start,end):
+    """World-length shortest connected component path, including both ends."""
+    maximum={'vertex':fn.numVertices,'edge':fn.numEdges,'face':fn.numPolygons}
+    if kind not in maximum:raise ValueError('Выберите вершины, рёбра или полигоны.')
+    if any(v<0 or v>=maximum[kind] for v in (start,end)):
+        raise ValueError('Компоненты больше не существуют. Повторите выделение.')
+    start,end=sorted((start,end))
+    if start==end:return [start]
+    points=fn.getPoints(om.MSpace.kWorld)
+    pairs=[fn.getEdgeVertices(e) for e in range(fn.numEdges)]
+    if kind in ('vertex','edge'):
+        lengths=[(points[a]-points[b]).length() for a,b in pairs]
+        links=defaultdict(list)
+        for edge,(a,b) in enumerate(pairs):links[a].append(edge);links[b].append(edge)
+        def adjacent(current):
+            if kind=='vertex':
+                for edge in links[current]:
+                    a,b=pairs[edge]
+                    yield b if a==current else a,lengths[edge]
+            else:
+                for vertex in pairs[current]:
+                    for other in links[vertex]:
+                        if other!=current:yield other,(lengths[current]+lengths[other])*.5
+    else:
+        centers=[];edges=[];uses=defaultdict(list)
+        iterator=om.MItMeshPolygon(fn.dagPath())
+        while not iterator.isDone():
+            vertices=list(iterator.getVertices())
+            centers.append(sum((om.MVector(points[v]) for v in vertices),om.MVector())/len(vertices))
+            edges.append(list(iterator.getEdges()))
+            for edge in edges[-1]:uses[edge].append(iterator.index())
+            iterator.next()
+        midpoints=[(om.MVector(points[a])+om.MVector(points[b]))*.5 for a,b in pairs]
+        def adjacent(current):
+            # Crossing an edge, rather than touching at a corner, makes a
+            # continuous face path. The shared edge lies on its surface route.
+            for edge in sorted(edges[current]):
+                midpoint=midpoints[edge]
+                for other in uses[edge]:
+                    if other!=current:
+                        yield other,(centers[current]-midpoint).length()+(centers[other]-midpoint).length()
+    distances={start:0.};previous={};queue=[(0.,start)]
+    while queue:
+        distance,current=heapq.heappop(queue)
+        if distance!=distances[current]:continue
+        if current==end:
+            result=[end]
+            while result[-1]!=start:result.append(previous[result[-1]])
+            return list(reversed(result))
+        for other,length in adjacent(current):
+            proposed=distance+length
+            if proposed<distances.get(other,float('inf')):
+                distances[other]=proposed;previous[other]=current
+                heapq.heappush(queue,(proposed,other))
+    raise ValueError('Между компонентами нет пути: они находятся в разных несвязанных частях меша.')
 
 
 class Mesh:

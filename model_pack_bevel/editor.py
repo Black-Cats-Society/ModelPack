@@ -165,9 +165,9 @@ class CurveEditor(QtWidgets.QWidget):
         if index is None:
             return
         menu = QtWidgets.QMenu(self)
-        auto = menu.addAction("Плавные автоматические касательные")
-        linear = menu.addAction("Линейный участок")
-        reset = menu.addAction("Сбросить кривую")
+        auto = menu.addAction('Smooth Auto Tangents')
+        linear = menu.addAction('Linear Segment')
+        reset = menu.addAction('Reset Curve')
         result = menu.exec(event.globalPos())
         if result is None:
             return
@@ -204,7 +204,7 @@ class ProfilePanel(QtWidgets.QWidget):
         self.falloff.changed.connect(on_falloff)
         self.profile.changed.connect(on_profile)
         layout.addWidget(self.tabs)
-        close = QtWidgets.QPushButton("Скрыть редактор")
+        close = QtWidgets.QPushButton('Hide Editor')
         close.clicked.connect(self.hide)
         layout.addWidget(close)
 

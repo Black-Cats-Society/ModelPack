@@ -1,33 +1,43 @@
-Model Pack 0.1.0-beta — installation
-==================================
+Model Pack + ReCurve + Fast Draft 0.1.152-beta
+================================
 
-Tested on Windows / Autodesk Maya 2027.
-Uses Maya's bundled Python, PySide6, shiboken6 and NumPy.
-
-1. Extract the entire ZIP to a permanent ASCII folder, such as C:/MayaTools.
-   Spaces in the path are supported.
+1. Extract the entire ZIP to a permanent ASCII folder, for example:
+   C:/MayaTools/ModelPack_ReCurve
 2. Open Maya and choose a Shelf tab.
-3. Drag install_model_pack.py from that folder into Maya's 3D viewport.
-4. An MP shelf button is created and the Model Pack panel opens.
-5. Choose Save All Shelves from the Shelf menu.
+3. Drag install_model_pack.py from that folder into a Maya 3D viewport.
+4. Save the shelf: Shelf > Save All Shelves.
 
-Keep the extracted folder in place. The button stores its path.
-The installer also writes maya/modules/ModelPack.mod in your Maya user folder,
-so scripts and history nodes are available when Maya restarts.
-Maya cannot reliably find Python plug-ins in non-ASCII paths when reopening
-saved scenes. The installer checks this before writing files or a shelf button.
+Keep all package files together. Reinstall after moving the folder.
+The existing MP shelf button is updated. ReCurve is included and loads
+automatically; a separate ReCurve installation is not required.
 
-If dragging fails, run this in Script Editor's Python tab with your own path:
+Select edge chains and click ReSegments or Control Curve in their grid row.
+Their controls, Apply and Cancel expand directly underneath.
+
+Shortcuts: Shift+R, Shift+Wheel, Ctrl+Shift+Wheel, Alt, Space/Enter and Esc.
+Curve deformation updates while dragging. See README.md for full instructions
+and VALIDATION.md for the tested environments and coverage.
+
+Click Fast Draft for the embedded Cylinder / Cube choice. Drag a footprint on a
+visible mesh, release, then drag outward from the surface to add or inward to cut.
+Depth follows the surface normal's screen direction. A face-on normal uses a
+stable fallback: up adds, down cuts. Release to commit.
+Shift+Wheel adjusts cylinder sides in place. Cubes have no subdivisions or Shift controls.
+Esc cancels the sketch; Q exits. Fast Draft is bundled and requires no installer
+or plug-in of its own. The outline is explicitly turquoise (#00CCCC).
+
+Added cylinders have soft side edges, hard cap borders and editable Radius,
+Height, Sides and Top Cap in the Channel Box. With Model Pack open, select one
+and press T in the viewport: Cap / Center / Parallel. This changes the top cap
+through persistent history, with Undo/Redo and UVs retained. Other objects keep
+their normal Maya T behavior. Cylinder cutters use N-gon caps and smooth walls,
+without the unwanted central floor vertex.
+
+Shift+Wheel requires active ReSegments. Ctrl+Z undoes live segment steps;
+Ctrl+Shift+Z or Ctrl+Y redoes them. History does not need to be enabled or deleted.
+Settings grow vertically and keep the window width fixed while switching.
+
+Script Editor alternative (Python tab; replace the folder path):
 
     import runpy
-    runpy.run_path(r'C:\MayaTools\ModelPack_0.1.0-beta\install_model_pack.py', run_name='__main__')
-
-To update, save your scene, close Maya and replace the full package.
-If its path changes, reinstall on the same Shelf tab and save your shelves.
-Reinstalling updates the existing MP button without creating a duplicate.
-
-To uninstall, remove MP and save the Shelf. Close Maya, remove ModelPack.mod
-from your Maya user modules folder, then remove the extracted package.
-Apply any Model Pack history you need before removing its files.
-
-Detailed tool instructions and troubleshooting are in README.md.
+    runpy.run_path(r'C:/MayaTools/ModelPack_ReCurve/install_model_pack.py', run_name='__main__')

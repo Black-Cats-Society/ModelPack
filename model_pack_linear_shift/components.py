@@ -71,16 +71,21 @@ def guide_directions(patch,axis):
         direction=max(compatible or candidates,key=lambda d:abs(d*axis))
         if normals and not compatible:
             # A boundary vertex can touch several source surfaces. Following
-            # just one of its edges would bend the others. Their common
-            # tangent is the only direction that preserves all those planes.
+            # just one of its edges would bend the others. Prefer their
+            # common tangent when it allows the selected section to move.
             basis=[]
             for n in normals:
                 residual=om.MVector(n)
                 for b in basis:residual-=b*(residual*b)
                 if residual.length()>1e-4:basis.append(residual.normal())
-            for b in basis:direction-=b*(direction*b)
-            if direction.length()>1e-8:direction=direction.normal()
-            else:direction=om.MVector()
+            tangent=om.MVector(direction)
+            for b in basis:tangent-=b*(tangent*b)
+            # A fully constrained corner has no common tangent. A tangent
+            # along the selected section cannot drive it either. Keep the
+            # actual source edge in those cases instead of seeding a zero
+            # guide which freezes the entire patch (and its interior rows).
+            if tangent.length()>1e-8 and abs(tangent.normal()*axis)>.05:
+                direction=tangent.normal()
         if direction*axis<0:direction=-direction
         directions[vertex]=direction;distances[vertex]=0.;heapq.heappush(queue,(0.,vertex,vertex))
     roots=dict(directions)
@@ -135,6 +140,10 @@ def analyze(mesh,ids,kind):
     for face in incident:
         poly=fn.getPolygonVertices(face)
         if set(poly)<=selected:continue
+        # A triangle remains planar when its selected corners move. Holding
+        # its old normal adds a false third constraint at a chamfered corner
+        # and can pin a whole selected floor against its two supporting walls.
+        if len(poly)==3:continue
         n=fn.getPolygonNormal(face,om.MSpace.kWorld).normal();origin=points[poly[0]]
         span=max((points[v]-origin).length() for v in poly)
         if max(abs(n*(points[v]-origin)) for v in poly)>max(1e-8,span*1e-5):continue
@@ -153,6 +162,7 @@ def analyze(mesh,ids,kind):
 class Gesture(core.Gesture):
     def __init__(self,patch,grip,pivot,*,plane=None,axis=None,directions=None,field_axis=None):
         self.chain=patch;self.original=dict(patch.points);self.current=dict(self.original)
+        self.edge_vectors=[(a,b,om.MVector(patch.points[b])-om.MVector(patch.points[a])) for a,b in patch.segments]
         self.plane=plane if plane is not None else patch.plane
         self.center,self.normal=self.plane;self.normal=self.normal.normal()
         self.current_plane=None
@@ -199,6 +209,17 @@ class Gesture(core.Gesture):
             self.weights={v:weight/maximum for v,weight in self.weights.items()}
         self.guides={0:axis*patch.length,1:-axis*patch.length}
         self.limits={v:stops({v:patch.external[v]},self.directions[v])[v] for v in patch.vertices}
+        for v,rail in self.directions.items():
+            # An intersection of two support planes can run between the two
+            # actual corner edges. It still stops at their fixed outer row;
+            # without this bound a tilt could pass through the pocket rim.
+            crossing=rail*field_axis
+            if abs(crossing)<1e-4:continue
+            bounded={side for side,_ in self.limits[v]}
+            for vector in patch.external[v]:
+                if vector.length()<1e-12 or abs(vector.normal()*field_axis)<.25:continue
+                distance=(vector*field_axis)/crossing;side=1 if distance>0 else -1
+                if side not in bounded:self.limits[v].append((side,abs(distance)))
 
     def moved(self,point):
         if self.current_plane is None:return point
@@ -228,6 +249,13 @@ class Gesture(core.Gesture):
             wanted=1 if distance>0 else -1
             if any(stop==wanted and abs(distance)>limit*(1.-1e-5) for stop,limit in self.limits[v]):return None
             positions[v]=tuple(om.MVector(p)+rail*distance)
+        # Converging rails must not pass a selected row through itself. The
+        # same common-amount clamp used for fixed neighbors also keeps edges
+        # from collapsing/reversing as a pocket is narrowed in the other direction.
+        for a,b,vector in self.edge_vectors:
+            squared=vector*vector
+            if squared>1e-20 and sum((positions[b][i]-positions[a][i])*vector[i] for i in range(3))<=squared*1e-5:
+                return None
         self.current_plane=(normal,offset)
         return positions
 

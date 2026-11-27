@@ -57,7 +57,11 @@ def _mesh_fn(mesh: str) -> om.MFnMesh:
     selection.add(mesh)
     path = selection.getDagPath(0)
     if path.node().hasFn(om.MFn.kTransform):
-        path.extendToShape()
+        shapes = cmds.listRelatives(path.fullPathName(), shapes=True, type="mesh",
+                                    noIntermediate=True, fullPath=True) or []
+        if not shapes:
+            raise SlideError("Выделение должно принадлежать polygon mesh.")
+        path = om.MSelectionList().add(shapes[0]).getDagPath(0)
     if not path.node().hasFn(om.MFn.kMesh):
         raise SlideError("Выделение должно принадлежать polygon mesh.")
     return om.MFnMesh(path)
@@ -65,7 +69,10 @@ def _mesh_fn(mesh: str) -> om.MFnMesh:
 
 def _mesh_position_tolerance(fn: om.MFnMesh, points, span: float = 0.0) -> float:
     """Account for float vertex rounding in object space and transformed scale."""
-    matrix = fn.dagPath().inclusiveMatrix()
+    return _position_tolerance(points, fn.dagPath().inclusiveMatrix(), span)
+
+
+def _position_tolerance(points, matrix, span: float = 0.0) -> float:
     inverse = matrix.inverse()
     local_magnitude = 0.0
     world_magnitude = 0.0
@@ -527,7 +534,7 @@ def _fraction_limits(plan: Plan, mode: str):
     return tuple(results)
 
 
-def _fractions(plan: Plan, amount: float, mode: Literal["relative", "distance", "uniform"]):
+def _fractions(plan: Plan, amount: float, mode: Literal["relative", "distance", "uniform"], *, fraction_limits=None):
     if not math.isfinite(amount) or amount <= 0:
         raise SlideError("Смещение должно быть положительным числом.")
     if plan.children:
@@ -539,7 +546,7 @@ def _fractions(plan: Plan, amount: float, mode: Literal["relative", "distance", 
         if length < _EPS:
             raise SlideError("Найдена направляющая нулевой длины.")
         lengths.append(length)
-    fraction_limits = _fraction_limits(plan, mode)
+    if fraction_limits is None:fraction_limits = _fraction_limits(plan, mode)
     if mode == "relative":
         fractions = tuple(min(amount, limit) for limit in fraction_limits)
         return fractions, max(fractions)
@@ -566,12 +573,12 @@ def _fractions(plan: Plan, amount: float, mode: Literal["relative", "distance", 
     raise SlideError("Режим должен быть relative, distance или uniform.")
 
 
-def preview_points(plan: Plan, amount: float, mode: Literal["relative", "distance", "uniform"] = "relative"):
+def preview_points(plan: Plan, amount: float, mode: Literal["relative", "distance", "uniform"] = "relative", *, fraction_limits=None):
     """Return future world-space points without changing the mesh."""
     if plan.children:
         results = [preview_points(child, amount, mode) for child in plan.children]
         return tuple(point for points, _ in results for point in points), max(actual for _, actual in results)
-    fractions, actual = _fractions(plan, amount, mode)
+    fractions, actual = _fractions(plan, amount, mode, fraction_limits=fraction_limits)
     points = []
     corner_limits = None
     for index, (start, end, fraction) in enumerate(zip(plan.starts, plan.ends, fractions)):

@@ -8,39 +8,50 @@ from model_pack_paths import plugin_path
 
 PLUGIN=plugin_path(Path(__file__).with_name('model_pack_modifier_nodes.py'))
 MIRROR_PLUGIN=plugin_path(Path(__file__).with_name('model_pack_fast_mirror_node.py'))
+PLUGIN_NAME=Path(PLUGIN).stem
+MIRROR_PLUGIN_NAME=Path(MIRROR_PLUGIN).stem
 
 
 def ensure_plugin(required=None):
     for plugin in ((required,) if required else (PLUGIN,MIRROR_PLUGIN)):
-        if not cmds.pluginInfo(plugin,q=True,loaded=True):cmds.loadPlugin(plugin,quiet=True)
-        if plugin==PLUGIN and 'modelPackSlideResult' not in (cmds.pluginInfo(plugin,q=True,dependNode=True) or []):
+        registered=Path(plugin).stem
+        if not cmds.pluginInfo(registered,q=True,loaded=True):cmds.loadPlugin(plugin,quiet=True)
+        if plugin==PLUGIN and 'modelPackCylinderCaps' not in (cmds.pluginInfo(registered,q=True,dependNode=True) or []):
+            module=importlib.import_module('model_pack_modifier_nodes')
+            if not hasattr(module,'CylinderCapsNode'):importlib.reload(module)
+            fn=om.MFnPlugin(om.MFnPlugin.findPlugin(Path(plugin).stem));cls=module.CylinderCapsNode
+            fn.registerNode(cls.name,cls.id,cls.creator,cls.initialize)
+        if plugin==PLUGIN and 'modelPackSlideResult' not in (cmds.pluginInfo(registered,q=True,dependNode=True) or []):
             module=importlib.import_module('model_pack_modifier_nodes')
             fn=om.MFnPlugin(om.MFnPlugin.findPlugin(Path(plugin).stem))
             cls=module.SlideResultNode
             fn.registerNode(cls.name,cls.id,cls.creator,cls.initialize)
             fn.registerCommand('modelPackSetSlideResult',module.SetSlideResult.creator)
-        if plugin==PLUGIN and 'modelPackMirrorEdit' not in (cmds.pluginInfo(plugin,q=True,command=True) or []):
+        if plugin==PLUGIN and 'modelPackMirrorEdit' not in (cmds.pluginInfo(registered,q=True,command=True) or []):
             from model_pack_mirror_session import MirrorEditCommand
             fn=om.MFnPlugin(om.MFnPlugin.findPlugin(Path(plugin).stem))
             fn.registerCommand('modelPackMirrorEdit',MirrorEditCommand.creator)
-        if plugin==PLUGIN and 'modelPackApplyMirror' not in (cmds.pluginInfo(plugin,q=True,command=True) or []):
+        if plugin==PLUGIN and 'modelPackApplyMirror' not in (cmds.pluginInfo(registered,q=True,command=True) or []):
             from model_pack_mirror_session import MirrorApplyCommand
             fn=om.MFnPlugin(om.MFnPlugin.findPlugin(Path(plugin).stem))
             fn.registerCommand('modelPackApplyMirror',MirrorApplyCommand.creator)
-        cmds.pluginInfo(plugin,e=True,autoload=True)
+        cmds.pluginInfo(registered,e=True,autoload=True)
     if not cmds.about(batch=True):cmds.pluginInfo(savePluginPrefs=True)
 
 
 def refresh_plugin():
-    if cmds.pluginInfo(PLUGIN,q=True,loaded=True):
+    if cmds.pluginInfo(PLUGIN_NAME,q=True,loaded=True):
         module=importlib.import_module('model_pack_modifier_nodes');importlib.reload(module)
-        for kind,implementation in (('modelPackResetTube',module.ResetTubeNode),('modelPackSlideResult',module.SlideResultNode)):
-            if kind not in (cmds.pluginInfo(PLUGIN,q=True,dependNode=True) or []):continue
+        for kind,implementation in (('modelPackResetTube',module.ResetTubeNode),('modelPackSlideResult',module.SlideResultNode),
+                                    ('modelPackCylinderCaps',module.CylinderCapsNode)):
+            if kind not in (cmds.pluginInfo(PLUGIN_NAME,q=True,dependNode=True) or []):continue
             for node in cmds.ls(type=kind) or []:
                 sel=om.MSelectionList();sel.add(node)
                 cls=type(om.MFnDependencyNode(sel.getDependNode(0)).userNode())
-                cls.compute=implementation.compute;cmds.dgdirty(node)
-    if cmds.pluginInfo(MIRROR_PLUGIN,q=True,loaded=True):
+                cls.compute=implementation.compute
+                if kind=='modelPackResetTube':cls.setDependentsDirty=implementation.setDependentsDirty
+                cmds.dgdirty(node)
+    if cmds.pluginInfo(MIRROR_PLUGIN_NAME,q=True,loaded=True):
         from maya import OpenMayaMPx as legacy_mpx
         mirror=importlib.import_module('model_pack_fast_mirror_node');importlib.reload(mirror)
         backend=importlib.import_module('model_pack_legacy_mesh')
@@ -197,11 +208,16 @@ def apply_mirrors(nodes):
                     helpers.update(cmds.listConnections(node+'.'+attr,s=True,d=False) or [])
             helpers.update(cmds.listConnections(node,s=True,d=False,type='unitConversion') or [])
         elif kind=='mirror_dup':
-            # Keep the exact effective transform, including the copy's edits.
-            plug=target+'.offsetParentMatrix';matrix=cmds.getAttr(plug)
+            # Commit the reflection to Maya's transform channels for FBX export.
+            plug=target+'.offsetParentMatrix'
+            local=om.MMatrix(cmds.getAttr(target+'.matrix'))*om.MMatrix(cmds.getAttr(plug))
             source=cmds.connectionInfo(plug,sourceFromDestination=True)
             if source:cmds.disconnectAttr(source,plug)
-            cmds.setAttr(plug,*matrix,type='matrix');helpers.add(node)
+            cmds.setAttr(plug,*tuple(om.MMatrix()),type='matrix')
+            cmds.xform(target,objectSpace=True,matrix=list(local))
+            if max(abs(value) for value in cmds.getAttr(target+'.shear')[0]) > 1e-10:
+                cmds.setAttr(target+'.shear',0,0,0,type='double3')
+            helpers.add(node)
         else:continue
         _mesh_fn(target).getPoints()
         if target not in results:results.append(target)
@@ -255,13 +271,16 @@ def mirror_duplicate(mesh,axis,space):
 
 
 def validate_reset_tube(mesh,seam):
-    from tube_resection import _MeshData,_order_seam,_extract_rings
+    from tube_resection import _MeshData
+    from model_pack_tube import _checked_rings
     md=_MeshData(_mesh_fn(mesh).dagPath())
-    rail,closed=_order_seam(md,seam);_extract_rings(md,rail,closed)
+    _checked_rings(md,seam)
 
 
 def reset_tube(mesh,seam,sides):
     ensure_plugin(PLUGIN);source=_mesh_fn(mesh);node=find('reset_tube',mesh)
+    if cmds.getAttr(mesh+'.visibility') and not cmds.getAttr(mesh+'.visibility',settable=True):
+        raise ValueError('Reset Tube: нельзя скрыть оригинал — его Visibility заблокирована или подключена.')
     if node is None:
         validate_reset_tube(mesh,seam)
         result=cmds.createNode('transform',name=mesh.split('|')[-1]+'_resect#')
@@ -273,9 +292,43 @@ def reset_tube(mesh,seam,sides):
         cmds.connectAttr(mesh+'.worldMatrix[0]',node+'.meshMatrix')
         cmds.connectAttr(node+'.outputMesh',shape+'.inMesh')
         tag(node,'reset_tube',mesh,result)
+        cmds.addAttr(node,ln='modelPackDeleteOriginal',at='bool',defaultValue=False)
         shading=cmds.listConnections(source.fullPathName(),type='shadingEngine') or ['initialShadingGroup']
         cmds.sets(result,e=True,forceElement=shading[0])
     else:cmds.setAttr(node+'.sides',sides)
     # Evaluate now so invalid source topology is reported inside the action.
     _mesh_fn(related(node)).getPoints()
+    hide_reset_source(node)
     return node
+
+
+def hide_reset_source(node):
+    source=related(node,'modelPackSource')
+    if source and cmds.getAttr(source+'.visibility'):cmds.setAttr(source+'.visibility',False)
+
+
+def reset_delete_original(node,value=None):
+    attr=node+'.modelPackDeleteOriginal'
+    if not cmds.objExists(attr):
+        if value is None:return False
+        cmds.addAttr(node,ln='modelPackDeleteOriginal',at='bool',defaultValue=False)
+    if value is not None and cmds.getAttr(attr)!=bool(value):cmds.setAttr(attr,bool(value))
+    return bool(cmds.getAttr(attr))
+
+
+def finish_reset_tubes(nodes):
+    """Bake opted-in outputs before deleting their source meshes; caller groups undo."""
+    for node in nodes:
+        if not cmds.objExists(node) or not reset_delete_original(node):continue
+        source=related(node,'modelPackSource');target=related(node)
+        if target is None:continue
+        source_shape=_mesh_fn(source).fullPathName() if source else None
+        # The result can have downstream vertex edits, UVs and materials.
+        _mesh_fn(target).getPoints()
+        cmds.delete(target,constructionHistory=True)
+        if source and cmds.objExists(source):
+            children=cmds.listRelatives(source,children=True,fullPath=True) or []
+            only_source=all(cmds.nodeType(child)=='mesh' and
+                (child==source_shape or cmds.getAttr(child+'.intermediateObject')) for child in children)
+            if only_source:cmds.delete(source)
+            elif source_shape and cmds.objExists(source_shape):cmds.delete(source_shape)

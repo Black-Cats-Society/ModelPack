@@ -3,8 +3,21 @@ from dataclasses import dataclass
 import math
 
 
-def gesture_mode(shift=False, ctrl=False):
-    return "local" if shift and ctrl else "segments" if shift else "shape" if ctrl else "width"
+WIDTH_SENSITIVITY = .2
+
+
+def right_gesture_mode(shift=False, ctrl=False):
+    if shift:
+        return "support_percent" if ctrl else "support_edges"
+    return "width" if ctrl else "support_percent"
+
+
+def gesture_mode(shift=False, ctrl=False, *, sharp=False):
+    if ctrl:
+        return "local" if shift else "shape"
+    if shift and not sharp:
+        return "segments"
+    return "width"
 
 
 @dataclass
@@ -16,6 +29,9 @@ class Gesture:
     scale: float
     axis: int | None = None
     direction: tuple | None = None
+    fine: bool = False
+    support_edges: int = 0
+    support_percent: float = 0.
 
     def amount(self, delta):
         if self.axis is None:
@@ -33,11 +49,14 @@ class Gesture:
 
     def value(self, delta):
         amount = self.amount(delta)
-        if self.mode == "segments":
+        if self.mode in ("segments", "support_edges"):
             step = math.floor(abs(amount) / 20) * (1 if amount >= 0 else -1)
-            return max(1, min(64, self.segments + step))
+            if self.mode == "segments":
+                return max(1, min(64, self.segments + step))
+            return max(0, self.support_edges + step)
+        if self.mode == "support_percent":
+            return max(0., self.support_percent + amount * .1)
         if self.mode == "shape":
             return max(-1, min(1, self.shape + amount / 100))
-        if self.mode == "local":
-            return amount * self.scale
-        return max(0, self.width + amount * self.scale)
+        width_delta = amount * self.scale * WIDTH_SENSITIVITY * (.2 if self.fine or self.mode == "local" else 1.)
+        return width_delta if self.mode == "local" else max(0, self.width + width_delta)

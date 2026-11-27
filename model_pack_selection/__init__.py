@@ -1,1 +1,1 @@
-"""Polygon region, directional growth and periodic ring selection."""
+"""Component paths, polygon regions, directional growth and periodic selection."""

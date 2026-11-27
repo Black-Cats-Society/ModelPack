@@ -78,6 +78,24 @@ class MirrorEditCommand(om.MPxCommand):
         if self.key in CHUNKS:self.active=True;ACTIVE[self.key]=self
 
 
+def _transform_mesh(data, matrix):
+    """Fold a transform into detached mesh data, including authored normals."""
+    mesh = om.MFnMesh(data)
+    normals = mesh.getNormals()
+    locked = {i for i in range(len(normals)) if mesh.isNormalLocked(i)}
+    if locked:
+        counts, normal_ids = mesh.getNormalIds()
+        _, vertex_ids = mesh.getVertices()
+        face_ids = (face for face, count in enumerate(counts) for _ in range(count))
+        corners = [(face, vertex, normal) for face, vertex, normal
+                   in zip(face_ids, vertex_ids, normal_ids) if normal in locked]
+    mesh.setPoints([point * matrix for point in mesh.getPoints()])
+    if locked:
+        faces, vertices, ids = zip(*corners)
+        directions = {i: om.MVector(normals[i]).transformAsNormal(matrix) for i in locked}
+        mesh.setFaceVertexNormals([directions[i] for i in ids], faces, vertices)
+
+
 class MirrorApplyCommand(om.MPxCommand):
     @staticmethod
     def creator():return MirrorApplyCommand()
@@ -93,9 +111,16 @@ class MirrorApplyCommand(om.MPxCommand):
             fn=_mesh_fn(target);data=om.MFnMeshData().create()
             output=om.MFnDependencyNode(fn.object()).findPlug('outMesh',False).asMObject()
             om.MFnMesh().copy(output,data)
-            self.snapshots.append((fn.fullPathName(),data))
-            values=materials(target)
-            if values[0]:shading.append((target,values))
+            local = None
+            if cmds.getAttr(node+'.modelPackTool') == 'mirror_dup':
+                local = om.MMatrix(cmds.getAttr(target+'.matrix')) * om.MMatrix(
+                    cmds.getAttr(target+'.offsetParentMatrix'))
+            self.snapshots.append((fn.fullPathName(),data,local))
+            # A shared cut can legitimately discard one whole member. Maya's
+            # shader query fails on its empty output; there are no faces to bind.
+            if fn.numPolygons:
+                values=materials(target)
+                if values[0]:shading.append((target,values))
         self.native=om.MDGModifier()
         self.native.pythonCommandToExecute(lambda:apply_mirrors(nodes))
         self.shading=om.MDGModifier() if shading else None
@@ -111,10 +136,15 @@ class MirrorApplyCommand(om.MPxCommand):
         self.native.doIt()
         # Maya's history deletion may replay its old cached input on Redo.
         # Restore the evaluated result captured before deleting that history.
-        for shape,data in self.snapshots:
+        for shape,data,local in self.snapshots:
             # Keep the template private: mesh shapes can mutate their input
             # data while native history deletion is undone.
             restored=om.MFnMeshData().create();om.MFnMesh().copy(data,restored)
+            if local is not None:
+                target = shape.rsplit('|',1)[0]
+                committed = om.MMatrix(cmds.getAttr(target+'.matrix'))
+                if not local.isEquivalent(committed,1e-10):
+                    _transform_mesh(restored, local * committed.inverse())
             _mesh_fn(shape).copyInPlace(restored)
         if self.shading is not None:self.shading.doIt()
     def undoIt(self):

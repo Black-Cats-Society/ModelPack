@@ -3,6 +3,7 @@ from maya import OpenMaya as old
 from maya.api import OpenMaya as om
 
 REGISTERED_NODE_CLASSES=globals().get('REGISTERED_NODE_CLASSES',set())
+JUNCTION_NODE_CLASSES=globals().get('JUNCTION_NODE_CLASSES',set())
 
 
 def ints(values):

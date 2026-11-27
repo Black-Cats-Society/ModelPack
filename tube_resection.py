@@ -23,9 +23,11 @@ Usage:
     tube_resection.launch_toolbox()
 
 Tool settings open below the main buttons.
-For Resect Tube, select the length-wise seam
-edge loop first, then click the button. A new mesh "<name>_resect" is created;
-the original is left untouched.
+For Resect Tube, select a tube mesh (or a length-wise seam edge loop).
+The seam is found from UV cuts, then topology, when no edges are selected.
+Shift + right drag in the viewport edits the side count. A new mesh
+"<name>_resect" is created; the original is hidden. The optional Delete
+original flag bakes the result and removes the source when the tool finishes.
 """
 
 import os
@@ -43,6 +45,20 @@ from model_pack_bevel import bevel_detection
 from model_pack_selection import ui as selection_ui
 from model_pack_linear_shift import ui as linear_shift_ui
 import model_pack_hard_edges as hard_edges
+import model_pack_nonplanar_hp
+import model_pack_surface_fit_ui
+import model_pack_recurve
+import model_pack_curve_mesh
+import model_pack_fast_draft
+import model_pack_pencil_curve
+import model_pack_curve_editor
+import model_pack_floater_pattern
+import model_pack_offset
+import model_pack_quad_dome
+import model_pack_floater
+import model_pack_extrudex
+import model_pack_crease
+import model_pack_auto_merge
 from model_pack_tool_panels import ToolPanels,EDITABLE
 
 try:
@@ -476,7 +492,7 @@ def _arcfracs(newP):
 # --------------------------------------------------------------------------- #
 #  build the new mesh
 # --------------------------------------------------------------------------- #
-def _resection_data(dag, seam_edge_ids, target_sides, progress_cb=None,matrix=None):
+def _resection_data(dag, seam_edge_ids, target_sides, progress_cb=None,matrix=None,length_segments=0,reduction_angle=None,extra_loops=0):
     if target_sides < 3:
         raise RuntimeError(u"Target sides должно быть >= 3.")
 
@@ -508,6 +524,45 @@ def _resection_data(dag, seam_edge_ids, target_sides, progress_cb=None,matrix=No
         bot_edges.append(_edge_uv(md, bot_ids, band_faces))
         top_edges.append(_edge_uv(md, top_ids, band_faces))
 
+    original_rings,original_bands=rings,bands
+    stations=None
+    if reduction_angle is not None:
+        from model_pack_tube import angle_samples,add_samples
+        source_profiles=[[md.P[v] for v in ring] for ring in rings]
+        stations=angle_samples(source_profiles,reduction_angle,closed)
+        if extra_loops:stations=add_samples(source_profiles,stations,extra_loops,closed)
+    elif extra_loops:
+        from model_pack_tube import add_samples
+        stations=add_samples(rings_new,[float(i) for i in range(M)],extra_loops,closed)
+    elif length_segments and length_segments!=nbands:
+        from model_pack_tube import longitudinal_samples
+        length_segments=max(3 if closed else 1,min(1024,int(length_segments)))
+        stations=longitudinal_samples(rings_new,length_segments,closed)
+    if stations is not None and stations!=[float(i) for i in range(M)]:
+        length_segments=len(stations) if closed else len(stations)-1
+        old_rings=rings_new;old_count=M;old_bands=nbands
+        def station(s):
+            j=min(old_bands-1,max(0,int(s)))
+            return j,max(0.,min(1.,s-j))
+        def point_at(s,i):
+            j,t=station(s)
+            a,b=old_rings[j][i],old_rings[(j+1)%old_count][i]
+            return tuple((1-t)*a[k]+t*b[k] for k in range(3))
+        def uv_at(s,end=False):
+            j,t=station(s)
+            if end and t<1e-10 and j>0:j-=1;t=1.
+            bx,bu,bv=bot_edges[j];tx,tu,tv=top_edges[j]
+            fractions=[i/Mt for i in range(Mt+1)]
+            return (fractions,
+                    [(1-t)*_interp1d(f,bx,bu)+t*_interp1d(f,tx,tu) for f in fractions],
+                    [(1-t)*_interp1d(f,bx,bv)+t*_interp1d(f,tx,tv) for f in fractions])
+        new_bot=[uv_at(stations[j]) for j in range(length_segments)]
+        new_top=[uv_at(stations[j+1] if j+1<len(stations) else float(old_bands),True) for j in range(length_segments)]
+        M=length_segments if closed else length_segments+1;nbands=length_segments
+        rings_new=[[point_at(stations[j],i) for i in range(Mt)] for j in range(M)]
+        centroids=[_centroid(ring) for ring in rings_new]
+        bot_edges,top_edges=new_bot,new_top
+
     fnew = [_arcfracs(rings_new[j]) for j in range(M)]
 
     # --- winding sign (outward normals) --------------------------------- #
@@ -516,7 +571,8 @@ def _resection_data(dag, seam_edge_ids, target_sides, progress_cb=None,matrix=No
     fcenter = _centroid([a0, a1, b1, b0])
     axis = _centroid([centroids[0], centroids[1]])
     ncand = _cross(_sub(a1, a0), _sub(b0, a0))
-    flip = _dot(ncand, _sub(fcenter, axis)) < 0.0
+    reference=_newell([md.P[v] for v in md.faceVerts[original_bands[0][2][0]]])
+    flip = _dot(ncand, reference) < 0.0
 
     def vid(j, i):
         return j * Mt + i
@@ -579,15 +635,18 @@ def _resection_data(dag, seam_edge_ids, target_sides, progress_cb=None,matrix=No
         nn = _normalize(_newell(ringP))
         outdir = _normalize(_sub(C, Cn))
         order = list(range(Mt))
-        if _dot(nn, outdir) < 0.0:
+        source_ring=original_rings[0 if j==0 else -1]
+        cap_faces=md.edge_faces(source_ring[0],source_ring[1])-set(band_faces_of_ring)
+        cap_normal=_newell([md.P[v] for v in md.faceVerts[min(cap_faces)]]) if cap_faces else outdir
+        if _dot(nn, cap_normal) < 0.0:
             order = order[::-1]
 
         # UV ids per new cap vertex (index i), reordered into gc order after.
         cap_uv_ids = [0] * Mt
-        capUV = _cap_boundary_uv(md, rings[j], band_faces_of_ring)
+        capUV = _cap_boundary_uv(md, source_ring, band_faces_of_ring)
         if capUV is not None:
             # preserve original cap UV: sample its boundary by arc fraction
-            oldP = [md.P[v] for v in rings[j]]
+            oldP = [md.P[v] for v in source_ring]
             Nn = len(oldP)
             seg = [_dist(oldP[t], oldP[(t + 1) % Nn]) for t in range(Nn)]
             tot = sum(seg) or 1.0
@@ -626,10 +685,10 @@ def _resection_data(dag, seam_edge_ids, target_sides, progress_cb=None,matrix=No
         cap_face_ids.append(len(polyCounts) - 1)
 
     if not closed:
-        if not md.is_open_ring(rings[0]):
-            add_cap(0, 1, bands[0][2])
-        if not md.is_open_ring(rings[M - 1]):
-            add_cap(M - 1, M - 2, bands[M - 2][2])
+        if not md.is_open_ring(original_rings[0]):
+            add_cap(0, 1, original_bands[0][2])
+        if not md.is_open_ring(original_rings[-1]):
+            add_cap(M - 1, M - 2, original_bands[-1][2])
 
     if progress_cb:
         progress_cb(90)
@@ -675,7 +734,7 @@ def resection(dag_str, seam_edge_ids, target_sides, progress_cb=None):
 
     cmds.polySoftEdge(newT, angle=180, ch=False)  # body: all edges soft
 
-    # caps: rim edges hard + triangulated fill
+    # Caps stay single n-gons; only their boundary edges become hard.
     if cap_face_ids:
         try:
             shp = cmds.listRelatives(newT, shapes=True, fullPath=True,
@@ -685,12 +744,11 @@ def resection(dag_str, seam_edge_ids, target_sides, progress_cb=None):
             rim = cmds.filterExpand(rim, sm=32) or []
             if rim:
                 cmds.polySoftEdge(rim, angle=0, ch=False)   # harden cap rim
-            cmds.polyTriangulate(cap_faces, ch=False)       # triangulate caps
         except Exception:
             pass
 
     # conform normals + orient outward (robust; independent of build winding,
-    # covers body and the triangulated caps)
+    # covers body and the n-gon caps)
     try:
         cmds.polyNormal(newT, normalMode=3, ch=False)       # conform consistent
         shp = cmds.listRelatives(newT, shapes=True, fullPath=True,
@@ -724,11 +782,17 @@ def resection(dag_str, seam_edge_ids, target_sides, progress_cb=None):
 #  TOOLBOX BUTTONS AND CONTEXT-MENU OPTION WIDGETS
 # --------------------------------------------------------------------------- #
 class ModelPackButton(QtWidgets.QPushButton):
-    """Keep the icon at the left inset and the caption at the right inset."""
+    """Draw compact pictograms and captions consistently across Maya styles."""
 
     _PADDING = 6
-    _ICON_COLUMN = 30
+    _ICON_COLUMN = 24
     _GAP = 4
+
+    def setIcon(self, value):
+        if self.property('toolIcon'):
+            from model_pack_tool_icons import icon
+            value = icon(self.property('toolIcon'))
+        super().setIcon(value)
 
     def sizeHint(self):
         size = super().sizeHint()
@@ -743,6 +807,7 @@ class ModelPackButton(QtWidgets.QPushButton):
         caption, icon = option.text, QtGui.QIcon(option.icon)
         option.text = ""
         option.icon = QtGui.QIcon()
+        if self.isChecked():option.palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor('#e5e9e7'))
         painter = QtWidgets.QStylePainter(self)
         painter.drawControl(QtWidgets.QStyle.CE_PushButton, option)
         contents = self.rect().adjusted(self._PADDING, 0, -self._PADDING, 0)
@@ -755,7 +820,7 @@ class ModelPackButton(QtWidgets.QPushButton):
         state = QtGui.QIcon.On if self.isChecked() else QtGui.QIcon.Off
         icon.paint(painter, icon_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, mode, state)
         text_rect = contents.adjusted(self._ICON_COLUMN + self._GAP, 0, 0, 0)
-        self.style().drawItemText(painter, text_rect, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+        self.style().drawItemText(painter, text_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter,
                                   option.palette, self.isEnabled(), caption, QtGui.QPalette.ButtonText)
 
 
@@ -855,10 +920,12 @@ class MirrorMenuWidget(QtWidgets.QWidget):
 class ResectMenuWidget(QtWidgets.QWidget):
     def __init__(self, parent=None,on_change=None):
         super(ResectMenuWidget, self).__init__(parent)
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
-        layout.addWidget(QtWidgets.QLabel("Target sides:"))
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(4)
+        layout = QtWidgets.QHBoxLayout();outer.addLayout(layout)
+        layout.addWidget(QtWidgets.QLabel('Число сторон:'))
+        self.setToolTip('Shift + ПКМ в 3D viewport: перетаскивание меняет число сторон (20 пикселей на шаг).')
         self.spin = QtWidgets.QSpinBox()
         self.spin.setRange(3, 256)
         self.spin.setKeyboardTracking(False)
@@ -866,13 +933,40 @@ class ResectMenuWidget(QtWidgets.QWidget):
         self.spin.valueChanged.connect(
             lambda v: cmds.optionVar(intValue=("ModelPack_ResectSides", v)))
         layout.addWidget(self.spin)
+        row=QtWidgets.QHBoxLayout();outer.addLayout(row)
+        self.reduce_loops=QtWidgets.QCheckBox('Reduce loops by angle',self);self.reduce_loops.setChecked(True)
+        row.addWidget(self.reduce_loops)
+        row=QtWidgets.QHBoxLayout();outer.addLayout(row)
+        row.addWidget(QtWidgets.QLabel('Removal angle:',self))
+        self.angle_spin=QtWidgets.QDoubleSpinBox(self);self.angle_spin.setRange(0.,180.)
+        self.angle_spin.setDecimals(2);self.angle_spin.setSingleStep(.5);self.angle_spin.setSuffix('°');self.angle_spin.setKeyboardTracking(False)
+        self.angle_spin.setToolTip('Средний угол между соседними полосами граней. При близких углах сначала удаляется луп с меньшей затронутой длиной. 0° удаляет лишние лупы на прямых участках.')
+        row.addWidget(self.angle_spin)
+        self.reduce_loops.toggled.connect(self.angle_spin.setEnabled)
+        row=QtWidgets.QHBoxLayout();outer.addLayout(row)
+        row.addWidget(QtWidgets.QLabel('Additional loops:',self))
+        self.extra_spin=QtWidgets.QSpinBox(self);self.extra_spin.setRange(0,1024);self.extra_spin.setKeyboardTracking(False)
+        row.addWidget(self.extra_spin)
+        if on_change is not None:
+            self.angle_spin.valueChanged.connect(on_change);self.extra_spin.valueChanged.connect(on_change)
+            self.reduce_loops.toggled.connect(on_change)
+        hint=QtWidgets.QLabel('Shift + RMB: sides · Ctrl + Shift + RMB: angle',self)
+        hint.setWordWrap(True);outer.addWidget(hint)
+        self.delete_original=QtWidgets.QCheckBox('Delete Original',self)
+        self.delete_original.setChecked(False)
+        self.delete_original.setToolTip('При завершении Reset Tube применить результат и удалить исходный меш. Пока инструмент активен, оригинал сохранён и скрыт.')
+        outer.addWidget(self.delete_original)
         if on_change is not None:self.spin.valueChanged.connect(on_change)
+        if on_change is not None:self.delete_original.toggled.connect(on_change)
 
 
 # --------------------------------------------------------------------------- #
 #  MAIN TOOLBOX UI
 # --------------------------------------------------------------------------- #
-class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
+from model_pack_theme import Dialog as ModelPackDialog
+
+
+class ModelPackToolbox(ToolPanels,ModelPackDialog):
 
     def __init__(self, parent=get_maya_main_window()):
         super(ModelPackToolbox, self).__init__(parent)
@@ -880,8 +974,11 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         self.setObjectName(WORKSPACE_WINDOW_NAME)
         self.setWindowFlags(self.windowFlags() ^ QtCore.Qt.WindowContextHelpButtonHint)
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        import model_pack_theme
+        model_pack_theme.apply(self)
         self.init_option_vars()
         self._active_tool = None
+        self._exit_callback = None
         self._changing_tool = False
         self._last_context = cmds.currentCtx()
         self._hard_edge_session = None
@@ -889,14 +986,94 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         self._hard_edge_compact_size = None
         self._edit_panel=None;self._edit_kind=None;self._modifier_nodes=[];self._edit_compact_size=None
         self.build_ui()
+        self._auto_merge=model_pack_auto_merge.Service(self)
         self._bevel_group_states = []
         self._bevel_group_callbacks = [om.MEventMessage.addEventCallback(event, self._restore_bevel_groups)
                                        for event in ("Undo", "Redo")]
         self._bevel_group_callbacks += [om.MEventMessage.addEventCallback(event,self._restore_modifier_controls)
                                         for event in ('Undo','Redo')]
+        self._nonplanar_hp_callbacks = [
+            om.MEventMessage.addEventCallback(event, self._rescan_nonplanar_hp)
+            for event in ('Undo', 'Redo')
+        ]
         self.slide_timer = QtCore.QTimer(self)
         self.slide_timer.timeout.connect(self._sync_slide_button)
         self.slide_timer.start(250)
+        model_pack_recurve.attach(self)
+        from model_pack_draft import cap_menu
+        cap_menu.attach(self)
+        self._exit_callback = om.MSceneMessage.addCallback(
+            om.MSceneMessage.kMayaExiting, self._close_for_maya_exit)
+
+        self._scene_reset_timer = QtCore.QTimer(self)
+        self._scene_reset_timer.setSingleShot(True)
+        self._scene_reset_timer.timeout.connect(self._reset_after_scene_edit)
+        self._scene_guard_callbacks = [
+            om.MDGMessage.addConnectionCallback(self._scene_connection_changed)
+        ]
+        for node_type in ('mesh', 'nurbsCurve'):
+            self._scene_guard_callbacks.extend((
+                om.MDGMessage.addNodeAddedCallback(self._scene_structure_changed, node_type),
+                om.MDGMessage.addNodeRemovedCallback(self._scene_structure_changed, node_type),
+            ))
+        for event in (om.MSceneMessage.kBeforeNew, om.MSceneMessage.kBeforeOpen,
+                      om.MSceneMessage.kBeforeImport, om.MSceneMessage.kBeforeLoadReference,
+                      om.MSceneMessage.kBeforeUnloadReference,
+                      om.MSceneMessage.kBeforeRemoveReference):
+            self._scene_guard_callbacks.append(
+                om.MSceneMessage.addCallback(event, self._reset_before_scene_change))
+
+    def _scene_connection_changed(self, source, destination, made, *_):
+        if self._active_tool is None or self._changing_tool:
+            return
+        # Topology commands can replace input history without creating a shape.
+        if destination.node().hasFn(om.MFn.kMesh) and destination.partialName(useLongNames=True) == 'inMesh':
+            self._queue_scene_reset(sys._getframe(1))
+
+    def _scene_structure_changed(self, *_):
+        self._queue_scene_reset(sys._getframe(1))
+
+    def _queue_scene_reset(self, frame):
+        if self._active_tool is None or self._changing_tool or getattr(self, '_model_pack_closed', False):
+            return
+        if getattr(self, '_control_curve_editor', None) is not None and (om.MGlobal.isUndoing() or om.MGlobal.isRedoing()):
+            return
+        # A tool can create and delete its own preview shapes synchronously.
+        # Only mutations originating outside Model Pack end its current session.
+        while frame is not None:
+            module = frame.f_globals.get('__name__', '')
+            if (module == __name__ or module == 'recurve' or
+                    module.startswith(('model_pack_', 'slide_for_maya.', 'recurve_'))):
+                return
+            frame = frame.f_back
+        # DG callbacks run in the middle of Maya's command. Defer scene writes
+        # until the command and its selection notifications have completed.
+        self._scene_reset_timer.start(0)
+
+    def _reset_after_scene_edit(self):
+        self._scene_reset_timer.stop()
+        if self._active_tool is None or getattr(self, '_model_pack_closed', False):
+            return
+        selected_names = om.MGlobal.getActiveSelectionList().getSelectionStrings()
+        try:
+            self._prepare_tool(None, interrupted=True)
+        finally:
+            # Re-resolve names: the previous selection may contain a preview
+            # shape that cleanup just deleted.
+            selection = om.MSelectionList()
+            for name in selected_names:
+                try:
+                    selection.add(name)
+                except RuntimeError:
+                    continue
+            if selection.length() or not selected_names:
+                om.MGlobal.setActiveSelectionList(selection)
+        self._sync_slide_button()
+
+    def _reset_before_scene_change(self, *_):
+        self._scene_reset_timer.stop()
+        if self._active_tool is not None and not getattr(self, '_model_pack_closed', False):
+            self._prepare_tool(None, interrupted=True)
 
     def init_option_vars(self):
         if not cmds.optionVar(exists="ModelPack_SelectionSkip"):
@@ -920,9 +1097,10 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         for key in ("ModelPack_CloneEdgeCount", "ModelPack_BevelEdgeCount"):
             if not cmds.optionVar(exists=key):
                 cmds.optionVar(intValue=(key, 1))
-        for key in ("ModelPack_CloneSecondaryPercent", "ModelPack_BevelSecondaryPercent"):
+        for key, default in (("ModelPack_CloneSecondaryPercent", 50),
+                             ("ModelPack_BevelOuterSpacingPercent", 20)):
             if not cmds.optionVar(exists=key):
-                cmds.optionVar(intValue=(key, 50))
+                cmds.optionVar(intValue=(key, default))
         for key, value in (("ModelPack_FindBevelSensitivity", 1),
                            ("ModelPack_FindBevelCorners", 1),
                            ("ModelPack_FindBevelReadyOnly", 0)):
@@ -931,8 +1109,10 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
 
     def build_ui(self):
         layout = QtWidgets.QGridLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(5)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
+        from model_pack_theme import TitleBar
+        layout.addWidget(TitleBar(self), 0, 0, 1, 2)
 
         self.icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
 
@@ -952,20 +1132,89 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
             ("UnBevel", "UnBevel.png", self.tool_unbevel, None),
             ("Select", "selection.svg", self.tool_selection, self.show_selection_menu),
             ("Plane Deform", "Plane_Deformation.png", self.tool_linear_shift, None),
+            ("ReSegments", "resegments.svg", self.tool_resegments, None),
+            ("Control Curve", "control_curve.svg", self.tool_control_curve, None),
+            ("Fast Draft", "fast_draft.svg", self.tool_fast_draft, self.show_fast_draft_menu),
+            ("Edge Flow", "edge_flow.svg", self.tool_edge_flow, None),
+            ("Auto Merge", "auto_merge.svg", self.tool_auto_merge, self.show_auto_merge_menu),
+            ("Pencil Curve", "pencil_curve.svg", self.tool_pencil_curve, None),
+            ("Offset", "offset.svg", self.tool_offset, None),
+            ("Quad Dome", "quad_dome.svg", self.tool_quad_dome, None),
+            ("Floater", "floater.svg", self.tool_floater, None),
+            ("Floater Fit", "surface_fit.svg", self.tool_surface_fit, None),
+            ("Curve Mesh", "", lambda: model_pack_curve_mesh.toggle(self), None),
+            ("ExtrudeX", "extrudex.svg", self.tool_extrudex, self.show_extrudex_menu),
+            ("Crease", "crease.svg", self.tool_crease, self.show_crease_menu),
+            ("Curve Editor", "control_curve.svg", self.tool_curve_editor, None),
+            ("Floater Pattern", "floater.svg", self.tool_floater_pattern, None),
+            ("Make Planar", "linear_shift.svg", self.tool_make_planar, None),
+            ("Clean History", None, self.tool_clean_history, None),
+            ("Intersect Curve", "intersect_curve.svg", self.tool_intersect_curve, None),
+            ("Nonplanar HP", None, lambda: model_pack_nonplanar_hp.toggle(self), None),
         ]
         positions = [(i // 2, i % 2) for i in range(len(buttons_data))]
 
         for i, data in enumerate(buttons_data):
             label, icon_file, cmd, context_cmd = data
             btn = ModelPackButton(label)
-            btn.setMinimumSize(100, 40)
-            full_icon_path = os.path.join(self.icon_path, icon_file)
-            if os.path.exists(full_icon_path):
-                btn.setIcon(QtGui.QIcon(full_icon_path))
-                btn.setIconSize(QtCore.QSize(30, 30) if label in ("Clone Slide", "Slide Bevel")
-                                else QtCore.QSize(24, 24))
+            btn.setMinimumSize(100, 34)
+            if icon_file:
+                full_icon_path = os.path.join(self.icon_path, icon_file)
+                if os.path.exists(full_icon_path):
+                    btn.setIcon(QtGui.QIcon(full_icon_path))
+                    btn.setIconSize(QtCore.QSize(30, 30) if label in ("Clone Slide", "Slide Bevel")
+                                    else QtCore.QSize(24, 24))
             btn.clicked.connect(lambda checked=False,command=cmd,name=label:self._run_tool(name,command))
             if label in ('Mirror Cut','Mirror Dup','Reset Tube'):btn.setCheckable(True)
+            if label == 'Fast Draft':
+                self.fast_draft_button = btn;btn.setCheckable(True)
+                btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setToolTip('Нарисовать цилиндр или куб на поверхности. Shift + колесо: стороны цилиндра. '
+                               'Первое движение — основание; второе от поверхности — добавить, внутрь — вырезать. Q — выйти.')
+            if label == 'Pencil Curve':
+                self.pencil_curve_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setToolTip('Рисовать кривую от руки с автоматическим уменьшением числа точек. ЛКМ — штрих; Esc — отменить; Q / W / E / R — выйти.')
+            if label == 'Curve Editor':
+                self.curve_editor_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setToolTip('Редактор кривых. Выделите CV и нажмите Bevel. ЛКМ — ширина; Shift + колесо — число точек; Enter / Esc — применить / отменить.')
+            if label == 'Floater Pattern':
+                self.floater_pattern_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setToolTip('Grid / Staggered флоатеры по поверхности. Выберите Source, Surface и при необходимости Boundary / Exclusions. Кривые обновляют Live Preview.')
+            if label == 'Offset':
+                self.offset_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setToolTip('Offset выбранного полигона с сохранением исходного радиуса скруглений. ЛКМ — отступ; Enter — применить; Esc — отменить.')
+            if label == 'Quad Dome':
+                self.quad_dome_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setToolTip('Квадовая скруглённая крышка выбранной плоской поверхности. Height — высота; Rings — плотность. Нечётный контур дополняется одной вершиной.')
+            if label == 'Floater':
+                self.floater_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setToolTip('Флоатер-канавка из кривой или выбранных цепочек рёбер. Рёбра сначала преобразуются в редактируемые кривые. Opening Width — ширина; Height — высота; Skirt — юбка.')
+            if label == 'Floater Fit':
+                self.surface_fit_button=btn;btn.setCheckable(True)
+                btn.setToolTip('Разместить меш на поверхности. Плоскость — привязка; дуги — поворот; голубые стрелки — зазор; центр — масштаб.')
+            if label == 'ExtrudeX':
+                self.extrudex_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setToolTip('ExtrudeX 1.01 · Joe Wu. Выберите открытые рёбра. ЛКМ и перетаскивание — Offset; Shift — Extrude; Ctrl — разведение углов; Q — завершить. ПКМ — выбор режима. Ctrl+Z — отменить операцию.')
+            if label == 'Crease':
+                self.crease_button=btn
+                btn.setToolTip('Назначить Crease выбранным рёбрам или хард-рёбрам объекта и применить Smooth. Криз удерживает грань, остальные поверхности сглаживаются. ПКМ — вес, уровни и отдельные действия. Ctrl+Z — отменить операцию.')
+            if label == 'ReSegments':
+                self.resegments_button = btn;btn.setCheckable(True)
+                btn.setIcon(model_pack_recurve.icon('resegments'))
+                btn.setToolTip('Перестроить выбранные цепочки рёбер. Shift+R — открыть; Shift+Wheel — сегменты; Alt — N-gons или Triangles.')
+            if label == 'Control Curve':
+                self.control_curve_button = btn;btn.setCheckable(True)
+                btn.setIcon(model_pack_recurve.icon('control_curve'))
+                btn.setToolTip('Изменять форму цепочек рёбер управляющими кривыми. Ctrl+Shift+Wheel — число CV; Space/Enter — применить; Esc — отменить.')
+            if label == 'Edge Flow':
+                self.edge_flow_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setIcon(model_pack_recurve.icon('edge_flow'))
+                btn.setToolTip('Relax — релакс рёбер; Space — равномерный шаг; Parallel — по направлению опоры; Equal Length — общая длина рёбер.')
+            if label == 'Auto Merge':
+                self.auto_merge_button=btn;btn.setCheckable(True);btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setIcon(model_pack_recurve.icon('auto_merge'))
+                btn.setToolTip('Автоматически объединять близкие вершины всего активного меша при выборе и после изменений. '
+                               'Работает, пока окно открыто. ПКМ — расстояние; Ctrl+Z — отменить слияние.')
             if label == "Clone Slide":
                 self.slide_button = btn
                 btn.setCheckable(True)
@@ -985,33 +1234,54 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
             if label == "Select":
                 self.selection_button = btn
                 btn.setCheckable(True)
-                btn.setToolTip("Область · Grow/Shrink · выбор с шагом по кольцу. ПКМ — команды.")
+                btn.setToolTip("Область · Path · Grow/Shrink · выбор с шагом по кольцу. ПКМ — команды.")
             if label == "Hard Edges":
                 self.hard_edge_button = btn
                 btn.setCheckable(True)
-                btn.setToolTip("Выделение рёбер по углу. Панель снизу: угол и Harden Edge.")
+                btn.setToolTip("Выделение рёбер по углу. Выберите полигоны перед запуском, чтобы ограничить поиск их рёбрами, включая границу выделения.")
             if label == "Plane Deform":
                 self.linear_shift_button = btn
                 btn.setCheckable(True)
                 btn.setToolTip("Наклон плоскости сечения со скольжением по соседним рёбрам. ПКМ — положение рамки: локально / глобально. Enter — выйти, Esc — отменить жест.")
+            if label == "Make Planar":
+                btn.setCheckable(True)
+                btn.setObjectName("modelPackMakePlanar")
+                btn.setToolTip("Выровнять выбранные полигоны. Можно закрепить вершины или задать опорную плоскость.")
+            if label == "Nonplanar HP":
+                self.nonplanar_hp_button = btn
+                btn.setCheckable(True)
+            if label == "Clean History":
+                btn.setObjectName("modelPackCleanHistory")
+                btn.setIcon(QtGui.QIcon(":/clearHistory.png"))
+                btn.setIconSize(QtCore.QSize(24, 24))
+                btn.setToolTip("Запечь историю Model Pack в меши и удалить оставшиеся узлы. Ctrl+Z — отменить.")
+            if label == "Intersect Curve":
+                btn.setObjectName("modelPackIntersectCurve")
+                btn.setToolTip("Выделите два полигональных объекта, чтобы построить кривые по линии пересечения. Ctrl+Z — отменить.")
             if context_cmd:
                 btn.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
                 btn.customContextMenuRequested.connect(context_cmd)
-            layout.addWidget(btn, positions[i][0], positions[i][1])
+            btn.setObjectName('modelPackTool')
+            btn.setProperty('toolIcon', label)
+            btn.setIcon(QtGui.QIcon())
+            btn.setIconSize(QtCore.QSize(20,20))
+            layout.addWidget(btn, positions[i][0] + 1, positions[i][1])
 
         self.unbevel_panel = QtWidgets.QWidget(self)
         self.unbevel_panel.setObjectName("unbevelActions")
+        self.unbevel_panel.setSizePolicy(QtWidgets.QSizePolicy.Preferred,QtWidgets.QSizePolicy.Maximum)
         unbevel_layout = QtWidgets.QVBoxLayout(self.unbevel_panel)
+        unbevel_layout.setAlignment(QtCore.Qt.AlignTop)
         unbevel_layout.setContentsMargins(0, 5, 0, 0)
         unbevel_layout.setSpacing(5)
         actions = QtWidgets.QHBoxLayout()
         unbevel_layout.addLayout(actions)
         actions.setSpacing(5)
-        self.remove_bevel_button = QtWidgets.QPushButton("Убрать фаски", self.unbevel_panel)
+        self.remove_bevel_button = QtWidgets.QPushButton('Remove Bevels', self.unbevel_panel)
         self.remove_bevel_button.setMinimumHeight(32)
         self.remove_bevel_button.setToolTip("Сразу убрать выделенные фаски. Ctrl+Z — вернуть результат.")
         self.remove_bevel_button.clicked.connect(self.tool_remove_bevels)
-        self.find_bevel_button = QtWidgets.QPushButton("Найти фаски", self.unbevel_panel)
+        self.find_bevel_button = QtWidgets.QPushButton('Find Bevels', self.unbevel_panel)
         self.find_bevel_button.setMinimumHeight(32)
         self.find_bevel_button.setToolTip("Выделен полигон — найти только его фаску. Выбран объект — найти все фаски. ПКМ — настройки поиска.")
         self.find_bevel_button.clicked.connect(lambda checked=False: self.tool_find_bevels())
@@ -1033,7 +1303,16 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         self._bevel_group_topology = {}
         self.bevel_groups_label.hide()
         self.bevel_groups_list.hide()
-        panel_row = (len(buttons_data)+1)//2
+        panel_row = (len(buttons_data)+1)//2 + 1
+        self.recurve_shortcut_labels = []
+        for column, text in enumerate(('Shift+Wheel · segments', 'Ctrl+Shift+Wheel · CVs')):
+            hint = QtWidgets.QLabel(text, self)
+            hint.setAlignment(QtCore.Qt.AlignCenter)
+            hint.setStyleSheet('color:#a4adb7;font-size:10px;')
+            hint.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            layout.addWidget(hint, panel_row, column)
+            self.recurve_shortcut_labels.append(hint)
+        panel_row += 1
         self._panel_row=panel_row
         layout.addWidget(self.unbevel_panel, panel_row, 0, 1, 2)
         self.unbevel_panel.hide()
@@ -1042,31 +1321,36 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         self.selection_panel.setObjectName("selectionActions")
         selection_layout = QtWidgets.QGridLayout(self.selection_panel)
         selection_layout.setContentsMargins(0,5,0,0)
-        commands = (("Область",self.tool_selection_region,0,0,2),
+        commands = (('Region',self.tool_selection_region,0,0,1),
+                    ("Path",self.tool_selection_path,0,1,1),
                     ("Grow",lambda:self.tool_selection_grow(),1,0,1),
                     ("Shrink",lambda:self.tool_selection_grow(shrink=True),1,1,1),
-                    ("Вдоль кольца",lambda:self.tool_selection_periodic(),2,0,1),
-                    ("Поперёк кольца",lambda:self.tool_selection_periodic(across=True),2,1,1))
+                    ('Along Loop',lambda:self.tool_selection_periodic(),2,0,1),
+                    ('Across Ring',lambda:self.tool_selection_periodic(across=True),2,1,1))
         self.selection_actions = {}
         for label,command,row,col,span in commands:
             button = QtWidgets.QPushButton(label,self.selection_panel)
             button.setMinimumHeight(32);button.clicked.connect(command)
             self.selection_actions[label] = button
             selection_layout.addWidget(button,row,col,1,span)
-        self.selection_actions["Область"].setCheckable(True)
-        self.selection_actions["Область"].setToolTip("Выделите контур полигонами и кликните внутри. Shift сохраняет контур.")
+        self.selection_actions['Region'].setCheckable(True)
+        self.selection_actions['Region'].setToolTip("Выделите контур полигонами и кликните внутри. Shift сохраняет контур.")
+        self.selection_actions['Path'].setCheckable(True)
+        self.selection_actions['Path'].setToolTip('Кратчайший путь: выберите начальный компонент и наведите курсор — путь подсветится. ЛКМ выбирает показанный путь; Shift + клик добавляет/снимает путь; Ctrl + Shift только добавляет.')
+        self.selection_actions['Path'].setFocusPolicy(QtCore.Qt.NoFocus)
+        self.selection_actions['Path'].setAutoDefault(False)
         for label in ("Grow","Shrink"):
             self.selection_actions[label].setToolTip("Без модификаторов — Maya · Ctrl — широкое направление · Shift — узкое.")
-        for label in ("Вдоль кольца","Поперёк кольца"):
-            self.selection_actions[label].setToolTip("Один полигон — всё кольцо; полоса — проредить выделение. Число пропусков задаётся под кнопками.")
+        for label in ('Along Loop','Across Ring'):
+            self.selection_actions[label].setToolTip("Повторить группу полигонов, рёбер или вершин целиком с заданным пропуском. Вершины следуют двум направлениям сетки четырёхугольников; рёбра — вдоль петли/поперёк кольца.")
         skip_row = QtWidgets.QWidget(self.selection_panel)
         skip_layout = QtWidgets.QHBoxLayout(skip_row)
         skip_layout.setContentsMargins(0,0,0,0)
-        skip_layout.addWidget(QtWidgets.QLabel("Пропускать полигонов",skip_row))
+        skip_layout.addWidget(QtWidgets.QLabel("Пропускать элементов",skip_row))
         self.selection_skip = QtWidgets.QSpinBox(skip_row)
         self.selection_skip.setRange(0,1000)
         self.selection_skip.setValue(int(cmds.optionVar(q="ModelPack_SelectionSkip")))
-        self.selection_skip.setToolTip("1 — каждый второй, 2 — каждый третий; 0 — все полигоны.")
+        self.selection_skip.setToolTip("Сколько компонентов пропускать между целыми группами. 0 — без промежутка. Один компонент: 1 — каждый второй, 2 — каждый третий.")
         self.selection_skip.valueChanged.connect(lambda value:cmds.optionVar(intValue=("ModelPack_SelectionSkip",value)))
         skip_layout.addWidget(self.selection_skip)
         selection_layout.addWidget(skip_row,3,0,1,2)
@@ -1099,29 +1383,67 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         layout.addWidget(self.hard_edge_panel,panel_row,0,1,2)
         self.hard_edge_panel.hide()
         self._sync_slide_button()
+        from model_pack_tool_icons import group_tools
+        group_tools(self, buttons_data)
 
     def _run_tool(self, name, command):
+        if name in ('Floater Fit', 'Curve Mesh', 'Nonplanar HP'):return command()
+        if name in ('ReSegments', 'Control Curve', 'Fast Draft', 'Auto Merge', 'Pencil Curve', 'Offset', 'Quad Dome', 'Floater', 'Curve Editor', 'Floater Pattern', 'ExtrudeX', 'Crease'):
+            return command()
         kind = {"Clone Slide":"clone","Slide Bevel":"slide_bevel","Bevel":"bevel",
                 "UnBevel":"unbevel","Select":"selection","Plane Deform":"linear_shift",
                 "Hard Edges":"hard_edges","Mirror Cut":"mirror_cut","Mirror Dup":"mirror_dup",
-                "Reset Tube":"reset_tube"}.get(name)
+                "Reset Tube":"reset_tube","Edge Flow":"edge_flow","Make Planar":"make_planar"}.get(name)
         if kind in ('mirror_cut','mirror_dup','reset_tube'):return command()
         self._prepare_tool(kind)
         command()
 
-    def _prepare_tool(self, kind):
+    def _stop_gesture_bevel(self, interrupted):
+        try:
+            if interrupted:
+                gesture_bevel_ui.cancel(restore_selection=False)
+        finally:
+            gesture_bevel_ui.shutdown()
+
+    def _prepare_tool(self, kind, interrupted=False):
         """Only one Model Pack tool and its auxiliary panels are active."""
+        timer = getattr(self, '_scene_reset_timer', None)
+        if kind is not None and timer is not None and timer.isActive():
+            self._reset_after_scene_edit()
         if (kind is not None and self._active_tool==kind) or self._changing_tool:return
         self._changing_tool = True
         try:
-            if kind!=self._edit_kind:self._close_edit_panel()
-            if kind!='hard_edges':self._clear_hard_edges()
-            if kind!="bevel":gesture_bevel_ui.shutdown()
-            if kind!="clone":slide_ui.deactivate_drag()
-            if kind!="slide_bevel":slide_ui.deactivate_bevel_drag()
-            if kind!="unbevel":unbevel_ui.shutdown()
-            if kind!="selection":selection_ui.shutdown()
-            if kind!="linear_shift":linear_shift_ui.shutdown()
+            stops = (
+                ('curve_editor', lambda: model_pack_curve_editor.shutdown(apply=not interrupted)),
+                ('floater_pattern', model_pack_floater_pattern.shutdown),
+                ('extrudex', model_pack_extrudex.shutdown),
+                ('fast_draft', lambda: model_pack_fast_draft.shutdown(preserve=not interrupted)),
+                ('pencil_curve', model_pack_pencil_curve.shutdown),
+                ('offset', lambda: model_pack_offset.shutdown(apply=not interrupted)),
+                ('quad_dome', lambda: model_pack_quad_dome.shutdown(apply=not interrupted)),
+                ('floater', lambda: model_pack_floater.shutdown(apply=not interrupted)),
+                ('surface_fit', lambda: model_pack_surface_fit_ui.close(self)),
+                ('recurve', lambda: model_pack_recurve.close_panel(self)),
+                ('curve_mesh', lambda: model_pack_curve_mesh.close(self)),
+                (model_pack_nonplanar_hp.TOOL_KIND, lambda: model_pack_nonplanar_hp.close(self)),
+                (self._edit_kind or 'edit_panel', lambda: self._close_edit_panel(interrupted=interrupted)),
+                ('hard_edges', self._clear_hard_edges),
+                ('bevel', lambda: self._stop_gesture_bevel(interrupted)),
+                ('clone', slide_ui.deactivate_drag),
+                ('slide_bevel', slide_ui.deactivate_bevel_drag),
+                ('unbevel', unbevel_ui.shutdown),
+                ('selection', selection_ui.shutdown),
+                ('linear_shift', linear_shift_ui.shutdown),
+            )
+            for owner, stop in stops:
+                if kind == owner:
+                    continue
+                try:
+                    stop()
+                except Exception as error:
+                    if not interrupted:
+                        raise
+                    cmds.warning(f'Model Pack: {owner} cleanup: {error}')
             if kind!="unbevel" and not self.unbevel_panel.isHidden():
                 self.unbevel_panel.hide();self.layout().activate()
                 if self._unbevel_compact_size is not None:self.resize(self._unbevel_compact_size)
@@ -1321,14 +1643,15 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         slide_ui.set_edge_count(count, bevel=bevel)
 
     def _edge_bias(self, bevel=False):
-        key = ("ModelPack_BevelSecondaryPercent" if bevel else
+        key = ("ModelPack_BevelOuterSpacingPercent" if bevel else
                "ModelPack_CloneSecondaryPercent")
         value = int(cmds.optionVar(q=key))
-        return min(100, max(0, ((value + 2) // 5) * 5))
+        return min(100, max(0, value if bevel else ((value + 2) // 5) * 5))
 
     def _set_edge_bias(self, percent, bevel=False):
-        percent = min(100, max(0, ((int(percent) + 2) // 5) * 5))
-        key = ("ModelPack_BevelSecondaryPercent" if bevel else
+        percent = int(percent)
+        percent = min(100, max(0, percent if bevel else ((percent + 2) // 5) * 5))
+        key = ("ModelPack_BevelOuterSpacingPercent" if bevel else
                "ModelPack_CloneSecondaryPercent")
         cmds.optionVar(intValue=(key, percent))
         slide_ui.set_edge_distribution(percent, bevel=bevel)
@@ -1345,13 +1668,17 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         spin.setRange(1, 16)
         spin.setValue(self._edge_count(bevel))
         layout.addWidget(spin, 0, 1)
-        label = QtWidgets.QLabel("Положение доп. рёбер", widget)
-        label.setToolTip("50% — равные интервалы; меньше — к исходному ребру, больше — к ведущему.\n"
-                         "На 0% и 100% промежуточные рёбра объединяются с краем.")
+        label = QtWidgets.QLabel("Шаг доп. рёбер" if bevel else "Положение доп. рёбер", widget)
+        label.setToolTip(
+            "Шаг дополнительных рёбер в процентах от ширины при подтверждении. Дальше шаг сохраняется при изменении ширины."
+            if bevel else
+            "50% — равные интервалы; меньше — к исходному ребру, больше — к ведущему.\n"
+            "На 0% и 100% промежуточные рёбра объединяются с краем."
+        )
         layout.addWidget(label, 1, 0)
         bias_spin = QtWidgets.QSpinBox(widget)
         bias_spin.setRange(0, 100)
-        bias_spin.setSingleStep(5)
+        bias_spin.setSingleStep(1 if bevel else 5)
         bias_spin.setKeyboardTracking(False)
         bias_spin.setSuffix("%")
         bias_spin.setValue(self._edge_bias(bevel))
@@ -1382,9 +1709,21 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         self._sync_slide_button()
 
     def _sync_slide_button(self):
+        timer = getattr(self, '_scene_reset_timer', None)
+        if timer is not None and timer.isActive():
+            return
+        model_pack_extrudex.sync(self)
+        model_pack_fast_draft.sync(self)
+        model_pack_pencil_curve.sync(self)
+        model_pack_curve_editor.sync(self)
+        model_pack_floater_pattern.sync(self)
+        model_pack_offset.sync(self)
+        model_pack_quad_dome.sync(self)
+        model_pack_floater.sync(self)
+        model_pack_recurve.sync_buttons(self)
         context = cmds.currentCtx()
         if (context!=self._last_context and self._active_tool is None and not self._changing_tool
-                and gesture_bevel_ui._TOOLBOX is self):
+                and gesture_bevel_ui._TOOLBOX is self and not gesture_bevel_ui._MANUAL_SELECT):
             gesture_bevel_ui._hide_values()
         self._last_context = context
         if not self._changing_tool:
@@ -1398,11 +1737,15 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
                        "selection":("selectSuperContext",selection_ui.CONTEXT),
                        "hard_edges":("selectSuperContext",),
                        "linear_shift":(linear_shift_ui.CONTEXT,)}
+            if gesture_bevel_ui._MANUAL_SELECT:
+                allowed['bevel'] += ('selectSuperContext',)
+            if selection_ui.path_enabled():allowed['selection']+=('moveSuperContext','RotateSuperContext','scaleSuperContext')
             if self._active_tool not in EDITABLE and self._active_tool in allowed and cmds.currentCtx() not in allowed[self._active_tool]:
                 self._prepare_tool(None)
         if hasattr(self,"selection_button"):
             self.selection_button.setChecked(not self.selection_panel.isHidden())
-            self.selection_actions["Область"].setChecked(selection_ui.active())
+            self.selection_actions['Region'].setChecked(selection_ui.active())
+            self.selection_actions['Path'].setChecked(selection_ui.path_enabled())
         if hasattr(self,"linear_shift_button"):
             self.linear_shift_button.setChecked(linear_shift_ui.active() or self._edit_kind=='linear_shift')
         if hasattr(self,'hard_edge_panel'):
@@ -1410,7 +1753,7 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         if hasattr(self, "unbevel_button"):
             self.unbevel_button.setChecked(not self.unbevel_panel.isHidden())
         if hasattr(self, "gesture_bevel_button"):
-            self.gesture_bevel_button.setChecked(gesture_bevel_ui.active())
+            self.gesture_bevel_button.setChecked(gesture_bevel_ui.active() or gesture_bevel_ui._MANUAL_SELECT)
         try:
             is_active = slide_ui.active()
             bevel_active = slide_ui.active_bevel()
@@ -1427,7 +1770,8 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         bevel_icon = "slide_bevel_on.png" if bevel_active else "slide_bevel_off.png"
         self.bevel_button.setIcon(QtGui.QIcon(os.path.join(self.icon_path, bevel_icon)))
         for button in self.findChildren(ModelPackButton):
-            kind={'Mirror Cut':'mirror_cut','Mirror Dup':'mirror_dup','Reset Tube':'reset_tube'}.get(button.text())
+            kind={'Mirror Cut':'mirror_cut','Mirror Dup':'mirror_dup','Reset Tube':'reset_tube','Edge Flow':'edge_flow',
+                  'Make Planar':'make_planar'}.get(button.text())
             if kind is not None:button.setChecked(self._edit_kind==kind)
 
     def _set_clone_mode(self, mode):
@@ -1439,8 +1783,8 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         sender = self.sender()
         menu = QtWidgets.QMenu(self)
         group = UniversalActionGroup(menu)
-        for label, mode in (("Пропорционально", "relative"),
-                            ("Равная ширина", "uniform")):
+        for label, mode in (('Relative', "relative"),
+                            ('Uniform Width', "uniform")):
             action = menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(self._clone_mode() == mode)
@@ -1469,10 +1813,17 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         else:self._close_edit_panel();self._active_tool=None
         self._sync_slide_button()
 
+    def tool_make_planar(self):
+        if self._edit_kind == 'make_planar':
+            self._close_edit_panel()
+        else:
+            self._show_edit_panel('make_planar')
+        self._sync_slide_button()
+
     def _linear_shift_menu(self):
         menu=QtWidgets.QMenu(self);group=UniversalActionGroup(menu)
         menu._frame_group=group
-        for label,mode in (("Локально","local"),("Глобально","global"),("Мировые","world")):
+        for label,mode in (('Local',"local"),('Global',"global"),('World',"world")):
             action=menu.addAction(label);action.setCheckable(True)
             action.setChecked(linear_shift_ui.frame_mode()==mode);group.addAction(action)
             action.triggered.connect(lambda checked=False,value=mode:linear_shift_ui.set_frame_mode(value))
@@ -1488,7 +1839,7 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
             button.setObjectName('planeSlideAxis'+axis.upper())
             button.setToolTip('Нормаль плоскости: '+axis.upper())
             button.setMinimumSize(36,24)
-            button.setStyleSheet('QPushButton:checked { background-color: #467c95; color: white; }')
+            button.setStyleSheet('')
             button.setChecked(selected_axis==axis);button.setEnabled(selected_axis is not None)
             axis_group.addButton(button);layout.addWidget(button)
             button.clicked.connect(lambda checked=False,value=axis:choose_axis(value))
@@ -1547,6 +1898,12 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         result = selection_ui.grow(shrink=shrink);self._sync_slide_button()
         return result
 
+    def tool_selection_path(self):
+        self._prepare_tool('selection')
+        if self.selection_panel.isHidden():self.tool_selection()
+        result=selection_ui.toggle_path(self);self._sync_slide_button()
+        return result
+
     def tool_selection_periodic(self,across=False):
         self._prepare_tool("selection")
         result = selection_ui.periodic(across=across,skip=int(cmds.optionVar(q="ModelPack_SelectionSkip")))
@@ -1555,12 +1912,15 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
 
     def _selection_menu(self):
         menu = QtWidgets.QMenu(self)
-        for label,command in (("Выделение области",self.tool_selection_region),
-                              ("Спец Grow",lambda:self.tool_selection_grow()),
-                              ("Спец Shrink",lambda:self.tool_selection_grow(shrink=True)),
-                              ("Вдоль кольца",lambda:self.tool_selection_periodic()),
-                              ("Поперёк кольца",lambda:self.tool_selection_periodic(across=True))):
-            menu.addAction(label).triggered.connect(lambda checked=False,action=command:action())
+        for label,command in (('Region Selection',self.tool_selection_region),
+                              ("Path",self.tool_selection_path),
+                              ('Directional Grow',lambda:self.tool_selection_grow()),
+                              ('Directional Shrink',lambda:self.tool_selection_grow(shrink=True)),
+                              ('Along Loop',lambda:self.tool_selection_periodic()),
+                              ('Across Ring',lambda:self.tool_selection_periodic(across=True))):
+            item=menu.addAction(label)
+            if label=='Path':item.setCheckable(True);item.setChecked(selection_ui.path_enabled())
+            item.triggered.connect(lambda checked=False,action=command:action())
         return menu
 
     def show_selection_menu(self,pos):
@@ -1713,22 +2073,22 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
 
     def _unbevel_menu(self):
         menu = QtWidgets.QMenu(self)
-        menu.addAction("Найти фаски в выбранных мешах").triggered.connect(
+        menu.addAction('Find Bevels in Selected Meshes').triggered.connect(
             lambda checked=False: self.tool_find_bevels(seeded=False))
-        menu.addAction("Расширить от выделенных полигонов фаски").triggered.connect(
+        menu.addAction('Expand from Selected Bevel Faces').triggered.connect(
             lambda checked=False: self.tool_find_bevels(seeded=True))
         menu.addSeparator()
-        sensitivity = menu.addMenu("Чувствительность поиска")
+        sensitivity = menu.addMenu('Search Sensitivity')
         group = UniversalActionGroup(sensitivity)
-        for index, label in enumerate(("Строгая", "Обычная", "Расширенная")):
+        for index, label in enumerate(('Strict', 'Normal', 'Extended')):
             action = sensitivity.addAction(label)
             action.setCheckable(True)
             action.setChecked(cmds.optionVar(q="ModelPack_FindBevelSensitivity") == index)
             group.addAction(action)
             action.triggered.connect(lambda checked=False, value=index: cmds.optionVar(
                 intValue=("ModelPack_FindBevelSensitivity", value)))
-        for label, key in (("Включать угловые стыки", "ModelPack_FindBevelCorners"),
-                           ("Только подтверждённые для UnBevel", "ModelPack_FindBevelReadyOnly")):
+        for label, key in (('Include Corners', "ModelPack_FindBevelCorners"),
+                           ('UnBevel Ready Only', "ModelPack_FindBevelReadyOnly")):
             action = menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(bool(cmds.optionVar(q=key)))
@@ -1743,8 +2103,51 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         sender = self.sender() or self.gesture_bevel_button
         gesture_bevel_ui.show_menu(self, sender.mapToGlobal(pos))
 
+    def _close_for_maya_exit(self, *_):
+        from shiboken6 import delete, isValid
+
+        # Maya can exit before Qt dispatches a deferred widget deletion.
+        if isValid(self) and self.close() and isValid(self):
+            delete(self)
+
+    def tool_surface_fit(self):
+        return model_pack_surface_fit_ui.toggle(self)
+
+    def _rescan_nonplanar_hp(self, *_):
+        panel = getattr(self, '_nonplanar_hp_panel', None)
+        if panel is not None:
+            panel.run(panel.rescan_after_undo)
+
     def closeEvent(self, event):
+        if getattr(self, '_model_pack_closed', False):
+            event.accept()
+            return
+        self._model_pack_closed = True
+        self._scene_reset_timer.stop()
+        for callback in self._scene_guard_callbacks:
+            om.MMessage.removeCallback(callback)
+        self._scene_guard_callbacks.clear()
+        model_pack_surface_fit_ui.close(self)
+        model_pack_curve_mesh.close(self)
+        model_pack_nonplanar_hp.close(self)
+        for callback in self._nonplanar_hp_callbacks:
+            om.MMessage.removeCallback(callback)
+        if self._exit_callback is not None:
+            om.MMessage.removeCallback(self._exit_callback)
+            self._exit_callback = None
+        self._auto_merge.close()
         self.slide_timer.stop()
+        from model_pack_draft import cap_menu
+        cap_menu.detach(self)
+        model_pack_fast_draft.shutdown()
+        model_pack_pencil_curve.shutdown()
+        model_pack_curve_editor.shutdown()
+        model_pack_floater_pattern.shutdown()
+        model_pack_offset.shutdown()
+        model_pack_quad_dome.shutdown()
+        model_pack_floater.shutdown()
+        model_pack_extrudex.shutdown()
+        model_pack_recurve.detach(self)
         self._clear_hard_edges()
         self._close_edit_panel()
         slide_ui.deactivate_drag();slide_ui.deactivate_bevel_drag()
@@ -1757,17 +2160,34 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
             gesture_bevel_ui.shutdown()
         super().closeEvent(event)
 
+    def tool_auto_merge(self):
+        self._auto_merge.set_enabled(self.auto_merge_button.isChecked())
+
+    def _auto_merge_menu(self):
+        menu=QtWidgets.QMenu(self);widget=QtWidgets.QWidget(menu)
+        row=QtWidgets.QHBoxLayout(widget);row.setContentsMargins(10,5,10,5)
+        row.addWidget(QtWidgets.QLabel('Distance (cm)',widget))
+        spin=QtWidgets.QDoubleSpinBox(widget);spin.setObjectName('autoMergeDistance')
+        spin.setDecimals(3);spin.setRange(.001,10.);spin.setSingleStep(.001)
+        spin.setKeyboardTracking(False);spin.setValue(self._auto_merge.distance)
+        spin.valueChanged.connect(self._auto_merge.set_distance);row.addWidget(spin)
+        action=QtWidgets.QWidgetAction(menu);action.setDefaultWidget(widget);menu.addAction(action)
+        return menu
+
+    def show_auto_merge_menu(self,pos):
+        sender=self.sender() or self.auto_merge_button
+        self._auto_merge_menu().exec_(sender.mapToGlobal(pos))
+
     def _set_bevel_mode(self, mode):
         cmds.optionVar(intValue=("ModelPack_BevelOffsetMode", 0 if mode == "relative" else 1))
-        if slide_ui.active_bevel():
-            slide_ui.activate_bevel_drag(mode=mode)
+        slide_ui.set_bevel_mode(mode)
 
     def show_bevel_context_menu(self, pos):
         sender = self.sender()
         menu = QtWidgets.QMenu(self)
         group = UniversalActionGroup(menu)
-        for label, mode in (("Пропорционально", "relative"),
-                            ("Равная ширина", "uniform")):
+        for label, mode in (('Relative', "relative"),
+                            ('Uniform Width', "uniform")):
             action = menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(self._bevel_mode() == mode)
@@ -1784,8 +2204,12 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
         if not self.hard_edge_panel.isHidden():
             self._clear_hard_edges();self._active_tool=None;self._sync_slide_button();return
         try:
+            regions = hard_edges.selected_face_regions()
+            meshes = hard_edges.selected_meshes()
             if cmds.currentCtx()!='selectSuperContext':cmds.setToolTo('selectSuperContext')
-            self._hard_edge_session=hard_edges.Selection(hard_edges.selected_meshes())
+            self._hard_edge_session=hard_edges.Selection(meshes, regions)
+            from model_pack_theme import UndoGroup
+            self._hard_edge_group=UndoGroup('Hard Edges',self._clear_hard_edges)
             cmds.undoInfo(openChunk=True,chunkName='Hard Edges')
             try:count=self._hard_edge_session.apply(self.hard_edge_slider.value()/10,configure=True)
             finally:cmds.undoInfo(closeChunk=True)
@@ -1815,6 +2239,8 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
             self.hard_edge_panel.hide();self.layout().activate()
             if self._hard_edge_compact_size is not None:self.resize(self._hard_edge_compact_size)
         self._hard_edge_compact_size=None
+        group=getattr(self,'_hard_edge_group',None);self._hard_edge_group=None
+        if group is not None:group.close()
 
     def _hard_edge_angle_changed(self,value):
         angle=value/10
@@ -1843,8 +2269,130 @@ class ModelPackToolbox(ToolPanels,QtWidgets.QDialog):
     def tool_resect_tube(self):
         return self._activate_modifier('reset_tube')
 
+    def tool_resegments(self):
+        model_pack_recurve.request(self, 'segments')
+
+    def tool_control_curve(self):
+        model_pack_recurve.request(self, 'controls')
+
+    def tool_fast_draft(self):
+        model_pack_fast_draft.toggle(self)
+
+    def tool_clean_history(self):
+        from model_pack_draft.cleanup import clean_history
+        try:
+            count = clean_history()
+        except (ValueError, RuntimeError) as error:
+            cmds.warning('Clean History: ' + str(error))
+            return
+        om.MGlobal.displayInfo(f'Clean History: мешей обработано — {count}.')
+
+    def tool_pencil_curve(self):
+        model_pack_pencil_curve.toggle(self)
+
+    def tool_intersect_curve(self):
+        from model_pack_intersection_curve import create_intersection_curves
+        try:
+            return create_intersection_curves()
+        except (ValueError, RuntimeError) as error:
+            cmds.warning('Intersect Curve: ' + str(error))
+
+    def tool_curve_editor(self):
+        model_pack_curve_editor.toggle(self)
+
+    def tool_floater_pattern(self):
+        model_pack_floater_pattern.toggle(self)
+
+    def tool_offset(self):
+        model_pack_offset.toggle(self)
+
+    def tool_quad_dome(self):
+        model_pack_quad_dome.toggle(self)
+
+    def tool_floater(self):
+        model_pack_floater.toggle(self)
+
+    def tool_extrudex(self):
+        model_pack_extrudex.toggle(self)
+
+    def show_extrudex_menu(self, pos):
+        model_pack_extrudex.menu(self).exec_(self.extrudex_button.mapToGlobal(pos))
+
+    def tool_crease(self):
+        return model_pack_crease.run(self)
+
+    def show_crease_menu(self, pos):
+        model_pack_crease.menu(self).exec_(self.crease_button.mapToGlobal(pos))
+
+    def show_fast_draft_menu(self,pos):
+        menu=model_pack_fast_draft.pattern_menu(self)
+        menu.exec_(self.fast_draft_button.mapToGlobal(pos))
+
+
+DOCK_NAME = 'ModelPackWorkspaceControl'
+
+
+def close_toolbox():
+    """Close embedded panels before deleting/reloading their Python classes."""
+    for widget in QtWidgets.QApplication.allWidgets():
+        if widget.objectName() == WORKSPACE_WINDOW_NAME:
+            widget.close()
+    if cmds.workspaceControl(DOCK_NAME, exists=True):
+        cmds.deleteUI(DOCK_NAME)
+
+
+def show_docked_toolbox(panel):
+    """Use Maya's native tab group; the content scrolls in short workspaces."""
+    import maya.OpenMayaUI as mui
+    import shiboken6
+    options = dict(label='Model Pack', retain=False, initialWidth=330,
+                   minimumWidth=max(310, panel.minimumSizeHint().width() + 18), closeCommand=lambda *args: panel.close())
+    target = next((name for name in ('ModelingToolkit', 'AttributeEditor',
+                                    'ChannelBoxLayerEditor')
+                   if cmds.workspaceControl(name, exists=True)), None)
+    if target:
+        options['tabToControl'] = (target, -1)
+    else:
+        options['dockToMainWindow'] = ('right', False)
+    cmds.workspaceControl(DOCK_NAME, **options)
+    container = shiboken6.wrapInstance(int(mui.MQtUtil.findControl(DOCK_NAME)),
+                                       QtWidgets.QWidget)
+    layout = container.layout()
+    if layout is None:
+        layout = QtWidgets.QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    scroll = QtWidgets.QScrollArea(container)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+    panel.setParent(scroll)
+    panel.setWindowFlags(QtCore.Qt.Widget)
+    panel.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
+    # A dock fills the available height; keep the grid at its natural height
+    # instead of distributing that surplus between every tool row.
+    panel.layout().setAlignment(QtCore.Qt.AlignTop)
+    header = panel.findChild(QtWidgets.QFrame, 'modelPackHeader')
+    if header:
+        header.show()
+        header.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, True)
+        close_button = header.findChild(QtWidgets.QPushButton, 'modelPackClose')
+        if close_button:
+            close_button.hide()
+    scroll.setWidget(panel)
+    layout.addWidget(scroll)
+    panel.show()
+    cmds.workspaceControl(DOCK_NAME, edit=True, restore=True)
+
 
 def launch_toolbox():
+    close_toolbox()
+    model_pack_extrudex.shutdown()
+    model_pack_fast_draft.shutdown()
+    model_pack_pencil_curve.shutdown()
+    model_pack_curve_editor.shutdown()
+    model_pack_floater_pattern.shutdown()
+    model_pack_offset.shutdown()
+    model_pack_quad_dome.shutdown()
+    model_pack_floater.shutdown()
     # Old windows call this helper too. Upgrade teardown before closing them.
     import model_pack_mirror_session
     importlib.reload(model_pack_mirror_session)
@@ -1863,10 +2411,12 @@ def launch_toolbox():
     unbevel_ui.shutdown()
     selection_ui.shutdown()
     linear_shift_ui.shutdown()
-    for name in ("model_pack_bevel.unbevel_regions","model_pack_bevel.unbevel_triangles","model_pack_bevel.unbevel_faces","model_pack_bevel.search_cache","model_pack_bevel.unbevel","model_pack_bevel.bevel_detection","model_pack_bevel.seeded_detection",
-                 "model_pack_selection.core","model_pack_selection.ui","model_pack_hard_edges",
-                 "model_pack_paths","model_pack_mirror_geometry","model_pack_legacy_mesh","model_pack_mirror_plane","model_pack_mirror_snap","model_pack_mirror_viewport","model_pack_modifiers","model_pack_mirror_session","model_pack_tool_panels",
-                 "model_pack_linear_shift.core","model_pack_linear_shift.components","model_pack_linear_shift.overlay","model_pack_linear_shift.ui"):
+    for name in ("model_pack_bevel.junctions","model_pack_bevel_junctions","model_pack_bevel.session","model_pack_bevel.unbevel_regions","model_pack_bevel.unbevel_triangles","model_pack_bevel.unbevel_faces","model_pack_bevel.search_cache","model_pack_bevel.unbevel","model_pack_bevel.bevel_detection","model_pack_bevel.seeded_detection",
+                 "model_pack_selection.core","model_pack_selection.path_mode","model_pack_selection.repeat","model_pack_selection.ui","model_pack_hard_edges","model_pack_edge_flow","model_pack_curve_bevel_geometry","model_pack_curve_editor","model_pack_intersection_curve","model_pack_pattern_lattice","model_pack_pattern_waves","model_pack_floater_pattern_geometry","model_pack_floater_pattern",
+                 "model_pack_paths","model_pack_mirror_geometry","model_pack_legacy_mesh","model_pack_mirror_plane","model_pack_mirror_snap","model_pack_mirror_viewport","model_pack_modifiers","model_pack_mirror_session","model_pack_tube","model_pack_tube_viewport","model_pack_tool_panels","model_pack_nonplanar_hp","model_pack_tool_icons",
+                 "model_pack_linear_shift.core","model_pack_linear_shift.components","model_pack_linear_shift.planar","model_pack_linear_shift.overlay","model_pack_linear_shift.ui","recurve_colors","model_pack_recurve",
+                 "model_pack_draft.core","model_pack_draft.curve_profile","model_pack_draft.cuts","model_pack_draft.cylinder_caps","model_pack_draft.cap_menu",
+                 "model_pack_draft.boolean_cleanup","model_pack_draft.snapping","model_pack_draft.hotkey_snaps","model_pack_draft.preview","model_pack_draft.patterns","model_pack_draft.tool","model_pack_fast_draft","model_pack_pencil_fit","model_pack_pencil_curve","model_pack_offset_geometry","model_pack_offset","model_pack_quad_dome_geometry","model_pack_quad_dome_mesh","model_pack_quad_dome","model_pack_floater_geometry","model_pack_mesh_safety","model_pack_floater_node","model_pack_floater_surface","model_pack_floater_surface_node","model_pack_floater","model_pack_surface_fit","model_pack_surface_fit_ui"):
         if name in sys.modules:
             importlib.reload(sys.modules[name])
     global model_pack_ui
@@ -1877,12 +2427,18 @@ def launch_toolbox():
         if callable(method):setattr(ModelPackToolbox,name,method)
     import model_pack_modifiers
     model_pack_modifiers.refresh_plugin()
+    from model_pack_bevel import session as bevel_session
+    bevel_session.refresh_plugin()
+    model_pack_floater.refresh_plugin()
+    model_pack_surface_fit_ui.refresh_nodes()
     # Recover connections left behind by earlier versions after window close.
-    cmds.undoInfo(openChunk=True,chunkName='Finish previous Mirror Cut')
-    try:model_pack_modifiers.freeze_mirror_frame(cmds.ls(type='modelPackMirrorCut') or [])
-    finally:cmds.undoInfo(closeChunk=True)
+    mirrors = (cmds.ls(type='modelPackMirrorCut') or []) if 'modelPackMirrorCut' in cmds.allNodeTypes() else []
+    if mirrors:
+        cmds.undoInfo(openChunk=True,chunkName='Finish previous Mirror Cut')
+        try:model_pack_modifiers.freeze_mirror_frame(mirrors)
+        finally:cmds.undoInfo(closeChunk=True)
     model_pack_ui = ModelPackToolbox()
-    model_pack_ui.show()
+    show_docked_toolbox(model_pack_ui)
 
 
 if __name__ == "__main__":

@@ -19,20 +19,50 @@ def selected_meshes():
     return shapes
 
 
-def _edge_angles(path):
+def selected_face_regions():
+    selection = om.MGlobal.getActiveSelectionList()
+    regions = {}
+    for index in range(selection.length()):
+        try:
+            path, component = selection.getComponent(index)
+        except RuntimeError:
+            continue
+        if component.isNull() or component.apiType() != om.MFn.kMeshPolygonComponent:
+            continue
+        if path.node().hasFn(om.MFn.kTransform):
+            path.extendToShape()
+        faces = om.MFnSingleIndexedComponent(component)
+        ids = range(faces.getCompleteData()) if faces.isComplete else faces.getElements()
+        regions.setdefault(path.fullPathName(), set()).update(ids)
+    return regions
+
+
+def _edge_angles(path, region=None):
     fn=om.MFnMesh(path)
-    normals=[fn.getPolygonNormal(face,om.MSpace.kWorld) for face in range(fn.numPolygons)]
+    normals={}
     edges=om.MItMeshEdge(path);values=[]
-    while not edges.isDone():
+    if region is not None:
+        polygons = om.MItMeshPolygon(path)
+        candidates = set()
+        for face in region:
+            if face < fn.numPolygons:
+                polygons.setIndex(face)
+                candidates.update(polygons.getEdges())
+    else:
+        candidates = range(fn.numEdges)
+    for edge in candidates:
+        edges.setIndex(edge)
         faces=edges.getConnectedFaces()
         # An angle requires two adjacent faces; open/nonmanifold edges have
         # no single dihedral angle.
         if len(faces)==2:
+            for face in faces:
+                if face not in normals:
+                    normals[face] = fn.getPolygonNormal(face, om.MSpace.kWorld)
             a,b=(normals[f] for f in faces)
             if a.length()>1e-12 and b.length()>1e-12:
                 cosine=max(-1.,min(1.,a.normal()*b.normal()))
-                values.append((math.degrees(math.acos(cosine)),edges.index()))
-        edges.next()
+                values.append((math.degrees(math.acos(cosine)),edge))
     values.sort()
     return tuple(v[0] for v in values),tuple(v[1] for v in values)
 
@@ -63,8 +93,9 @@ def _selected_mask():
 
 class Selection:
     """Keep the activation targets even if a threshold deselects all edges."""
-    def __init__(self,meshes):
+    def __init__(self,meshes,face_regions=None):
         self.paths=[_mesh_fn(mesh).dagPath() for mesh in meshes]
+        self.regions = [(path, (face_regions or {}).get(path.fullPathName())) for path in self.paths]
         self.dirty=True;self.tables=[];self.callbacks=[]
         try:
             seen=set()
@@ -94,7 +125,8 @@ class Selection:
         paths=self._live_paths()
         if not paths:raise ValueError('Исходные меши удалены. Выделите меш и снова включите Hard Edges.')
         if self.dirty or len(paths)!=len(self.tables):
-            self.tables=[(path,*_edge_angles(path)) for path in paths]
+            self.tables=[(path,*_edge_angles(path, region))
+                         for path, region in self.regions if path in paths]
             self.dirty=False
         result={}
         for path,angles,edges in self.tables:

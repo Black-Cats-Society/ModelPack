@@ -100,11 +100,12 @@ class LocalMesh:
         return faces
 
 
-def walk_profile(data,section,incoming):
+def walk_profile(data,section,incoming,*,trails=None):
     """Continue the profile's quad direction without re-inferring it per cell."""
     faces={s[0] for s in section};initial=set(faces)
     for side in (1,3):
         row=list(section);edges=list(incoming);previous_step=None
+        if trails is not None:trails.append([])
         while True:
             following=[]
             for state,edge in zip(row,edges):
@@ -146,9 +147,68 @@ def walk_profile(data,section,incoming):
                         return sum(math.acos(max(-1.,min(1.,a*b))) for a,b in zip(vectors,vectors[1:]))
                     before=bend(row,edges);after=bend(following,next_edges)
                     if before>.05 and not .4<after/before<2.5:break
+                if trails is not None:trails[-1].append(frozenset(new))
                 faces.update(new);row=following;edges=next_edges;continue
             break
     return faces
+
+
+def _narrow_seed_band(data,seed):
+    """Recover a narrow collar below a broader fillet from its width break.
+
+    Its last facet can be nearly tangent to a parent, so requiring a large
+    normal turn at every facet misses it. Keep the evidence local: a thin
+    cross-section, wider supports, a monotone normal transition and a complete
+    reconstructible strip. Uniform curved walls never provide that width break.
+    """
+    edges=data.face_edges[seed]
+    if len(edges)!=4:return None
+    short=min(range(2),key=lambda i:data.lengths[edges[i]]+data.lengths[edges[i+2]])
+    width=(data.lengths[edges[short]]+data.lengths[edges[short+2]])*.5
+    if width>=min(data.lengths[edges[1-short]],data.lengths[edges[3-short]])*.35:return None
+    seen={seed};sides=[];parents=[]
+    for index in (1-short,3-short):
+        face=seed;cross=edges[index];side=[]
+        while True:
+            adjacent=[f for f in data.edge_faces[cross] if f!=face]
+            if len(adjacent)!=1:return None
+            following=adjacent[0]
+            if following in seen:return None
+            es=data.face_edges[following]
+            if len(es)!=4:break
+            entry=es.index(cross);step=sum(data.lengths[e] for i,e in enumerate(es) if i%2!=entry%2)*.5
+            if not .65*width<=step<=1.5*width:break
+            if data.normals[face]*data.normals[following]<.5:return None
+            seen.add(following);side.append((following,entry%2));face=following;cross=es[(entry+2)%4]
+            if len(seen)>64:return None
+        sides.append(side);parents.append(following)
+    section=list(reversed(sides[0]))+[(seed,1-short)]+sides[1]
+    normals=[data.normals[f] for f in parents]
+    if normals[0]*normals[1]>math.cos(math.radians(2)):return None
+    if not all(search._cone(data.normals[f],normals,2) for f,_ in section):return None
+    span=sum(sum(data.lengths[e] for i,e in enumerate(data.face_edges[f]) if i%2!=parity)*.5 for f,parity in section)
+    supports=[data.widths[data.region_for[f]] for f in parents]
+    if span>=max(supports)*.9 or span>=min(supports)*1.5:return None
+    previous=parents[0];incoming=[]
+    for face,_ in section:
+        edge=next((e for e in data.face_edges[face] if previous in data.edge_faces[e]),None)
+        if edge is None:return None
+        incoming.append(edge);previous=face
+    trails=[];patch=walk_profile(data,section,incoming,trails=trails)
+    # A width-compatible cell at an intersection may belong to the next bevel.
+    # Validate the full span first: one-sided end normals can be less reliable
+    # than both neighboring support facets together. Trim whole terminal cells,
+    # keeping the seed profile and the largest reconstructible band.
+    attempts=0
+    for count in range(sum(map(len,trails))+1):
+        for first in range(max(0,count-len(trails[1])),min(count,len(trails[0]))+1):
+            last=count-first;removed=set()
+            for trail,number in zip(trails,(first,last)):
+                if number:removed.update(set().union(*trail[-number:]))
+            group=search._group(data,patch-removed,'seed');attempts+=1
+            if group.ready:return group
+            if attempts>=64:return None
+    return None
 
 
 def detect_seeded(mesh,seeds,*,include_corners=True,_data=None):
@@ -157,6 +217,11 @@ def detect_seeded(mesh,seeds,*,include_corners=True,_data=None):
     if not seeds or any(f<0 or f>=data.fn.numPolygons for f in seeds):
         raise ValueError('Выберите существующий полигон фаски.')
     result=[];covered=set()
+    if include_corners:
+        for group in search._quad_network_groups(data, sorted(seeds)):
+            result.append(group)
+            covered.update(group.faces)
+            data.reusable.update(group.faces)
     for seed in sorted(seeds):
         if seed in covered:continue
         quad_seeds={seed} if len(data.faces[seed])==4 else {f for f in data.neighbors[seed] if len(data.faces[f])==4}
@@ -198,6 +263,10 @@ def detect_seeded(mesh,seeds,*,include_corners=True,_data=None):
             for p in search._components(thin,data.neighbors):
                 patch=search._attach_fans(data,p) if include_corners else p
                 if seed in patch:thin_choices.append(patch)
+        if not any(g.ready and ids[f]==seed for g in found.groups for f in g.faces):
+            narrow=_narrow_seed_band(data,seed)
+            if narrow is not None:
+                result.append(narrow);covered.update(narrow.faces);continue
         if thin_choices and (not any(ids[f]==seed for g in found.groups for f in g.faces) or
                              any(len(data.faces[f])==3 for p in thin_choices for f in p)):
             patch=min(thin_choices,key=lambda p:len(p));group=search._group(data,patch,'seed')

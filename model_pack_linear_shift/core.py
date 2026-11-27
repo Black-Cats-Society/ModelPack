@@ -305,8 +305,10 @@ class Gesture:
             raise ValueError("Сетка изменилась. Заново выделите компоненты.")
 
     def _write(self,positions):
+        # API points use centimeters; xform interprets the current scene unit.
+        scale=om.MDistance(1.,om.MDistance.kCentimeters).asUnits(om.MDistance.uiUnit())
         for vertex,point in positions.items():
-            cmds.xform(self.chain.mesh+f".vtx[{vertex}]",worldSpace=True,translation=point)
+            cmds.xform(self.chain.mesh+f".vtx[{vertex}]",worldSpace=True,translation=tuple(value*scale for value in point))
 
     def update(self,delta):
         self._check()

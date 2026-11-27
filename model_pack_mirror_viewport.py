@@ -28,7 +28,7 @@ def global_scale():
     return float(value[0] if isinstance(value,(list,tuple)) else value)
 
 
-def project_geometry(node,pose,projection,size=1.):
+def project_geometry(node,pose,projection,size=1.,nodes=None):
     center=plane.origin(pose);axes=[v.normal() for v in plane.basis(pose)]
     start=projection.point(center)
     lengths=[math.hypot(projection.point(center+v)[0]-start[0],projection.point(center+v)[1]-start[1]) for v in axes]
@@ -38,7 +38,7 @@ def project_geometry(node,pose,projection,size=1.):
         segment=projection.line(center+axis*scale*.15,center+axis*scale)
         if segment:controls.append(dict(kind='move',axis=index,segments=[segment],tip=projection.point(center+axis*scale)))
         midpoint=projection.point(center+axis*scale*.50)
-        if midpoint[2] and cmds.nodeType(node)=='modelPackMirrorCut':
+        if midpoint[2]:
             controls.append(dict(kind='direction',axis=index,point=midpoint[:2]))
         other=[v for i,v in enumerate(axes) if i!=index][0]
         u=other-axis*(other*axis)
@@ -60,7 +60,7 @@ def project_geometry(node,pose,projection,size=1.):
                 polygon=[(middle[0]+x*half[0],middle[1]+y*half[1]) for x,y in ((-1,-1),(1,-1),(1,1),(-1,1))]
             controls.append(dict(kind='axis',axis=index,polygon=polygon,segments=list(zip(polygon,polygon[1:]+polygon[:1]))))
     if start[2]:controls.append(dict(kind='free',axis=None,point=start[:2]))
-    return dict(node=node,pose=pose,center=center,axes=axes,scale=scale,controls=controls,plane=projection.polygon(plane.bounds(node,pose)))
+    return dict(node=node,pose=pose,center=center,axes=axes,scale=scale,controls=controls,plane=projection.polygon(plane.bounds(nodes or node,pose)))
 
 
 def pick(layouts,point):
@@ -141,7 +141,7 @@ class Canvas(overlay.Canvas):
         painter.setPen(QtGui.QPen(GOLD,1.4));painter.setBrush(fill)
         if polygon:painter.drawPolygon(QtGui.QPolygonF([point(p) for p in polygon]))
         axis=cmds.getAttr(layout['node']+'.'+plane.fields(layout['node'])[0])
-        direction=plane.direction(layout['node'])
+        direction=plane.direction(layout['node']) if cmds.nodeType(layout['node'])=='modelPackMirrorCut' else 0
         for control in layout['controls']:
             key=(layout['node'],control['kind'],control['axis'])
             color=HOT if self.manager.hover==key else GOLD
@@ -212,14 +212,10 @@ class Viewport(overlay.Overlay):
         self.tick()
 
     def layout(self,projection):
-        result=[]
-        for node in self.nodes:
-            if not cmds.objExists(node) or not cmds.objExists(node+'.'+plane.POSE):continue
-            try:
-                layout=project_geometry(node,plane.frame(node),projection,self.gizmo_size)
-                result.append(layout)
-            except (RuntimeError,ValueError):continue
-        return result
+        nodes=[node for node in self.nodes if cmds.objExists(node) and cmds.objExists(node+'.'+plane.POSE)]
+        if not nodes:return []
+        try:return [project_geometry(nodes[0],plane.frame(nodes[0]),projection,self.gizmo_size,nodes=nodes)]
+        except (RuntimeError,ValueError):return []
 
     def tick(self):
         if self.closed:return
@@ -304,11 +300,12 @@ class Viewport(overlay.Overlay):
             editor.input.setStyleSheet('border:1px solid #eb544b;');editor.input.setToolTip('Введите угол числом, например 17,5.')
             return
         self.release()
-        if cmds.objExists(context['node']):
+        nodes=[node for node in context['nodes'] if cmds.objExists(node)]
+        if nodes:
             result=plane.rotated(context['pose'],context['axis'],math.radians(degrees))
-            if not plane.frame(context['node']).isEquivalent(result,1e-10):
+            if any(not plane.frame(node).isEquivalent(result,1e-10) for node in nodes):
                 cmds.undoInfo(openChunk=True,chunkName='Mirror plane angle')
-                try:plane.write(context['node'],result)
+                try:plane.write_many(nodes,result)
                 finally:cmds.undoInfo(closeChunk=True)
         self.hide_angle();self.tick()
         if self.canvas is not None:self.canvas.viewport.setFocus(QtCore.Qt.OtherFocusReason)
@@ -335,10 +332,10 @@ class Viewport(overlay.Overlay):
             # reflected vertices. Read the geometry at the gesture's start,
             # so the plane cannot chase its own changing reflection.
             with without_undo():
-                if drag['changed']:plane.restore(drag['node'],drag['before'])
+                if drag['changed']:plane.restore_many(drag['before'])
                 try:drag['snap_cache']=snapping.PointCache(drag['projection'],self.panel)
                 finally:
-                    if drag['changed']:plane.write(drag['node'],drag['final'])
+                    if drag['changed']:plane.write_many(drag['nodes'],drag['final'])
         limit=snapping.tolerance()
         if limit is not None:
             try:limit/=self.view.portWidth()/self.canvas.width()
@@ -356,8 +353,11 @@ class Viewport(overlay.Overlay):
         if control['kind'] in ('axis','direction'):
             if control['kind']=='direction':
                 selected=cmds.getAttr(layout['node']+'.'+plane.fields(layout['node'])[0])
-                direction=1-plane.direction(layout['node']) if selected==control['axis'] else 0
-                cmds.optionVar(intValue=('ModelPack_MirrorDirection',direction))
+                if cmds.nodeType(layout['node'])=='modelPackMirrorCut':
+                    direction=1-plane.direction(layout['node']) if selected==control['axis'] else 0
+                    cmds.optionVar(intValue=('ModelPack_MirrorDirection',direction))
+                elif selected==control['axis']:
+                    return True  # Duplicate reflects the entire mesh; an axis has no +/- side.
             cmds.optionVar(intValue=('ModelPack_MirrorAxis',control['axis']))
             self.owner._modifier_settings_changed(self.owner._edit_kind)
             self.owner._restore_modifier_controls();self.tick();return True
@@ -366,8 +366,9 @@ class Viewport(overlay.Overlay):
         _,ray=self.ray(point);right=om.MVector(0,1,0)^ray
         if right.length()<1e-8:right=om.MVector(1,0,0)
         right.normalize();up=ray^right
-        self.dragging=dict(node=layout['node'],kind=control['kind'],axis=axis,pose=pose,
-                           before=plane.snapshot(layout['node']),anchor=point,scale=layout['scale'],projection=projection,
+        nodes=[node for node in self.nodes if cmds.objExists(node)]
+        self.dragging=dict(node=layout['node'],nodes=nodes,kind=control['kind'],axis=axis,pose=pose,
+                           before=plane.snapshot_many(nodes),anchor=point,scale=layout['scale'],projection=projection,
                            center=center,right=right,up=up,ray=ray,changed=False,axis_index=index,last_point=point)
         self.snap_target=None
         if control['kind'] in ('move','free') and self.snap_mode()=='point':
@@ -419,8 +420,8 @@ class Viewport(overlay.Overlay):
         if result.isEquivalent(drag.get('final',pose),1e-10):return
         reset=result.isEquivalent(pose,1e-10)
         with without_undo():
-            if reset:plane.restore(drag['node'],drag['before'])
-            else:plane.write(drag['node'],result)
+            if reset:plane.restore_many(drag['before'])
+            else:plane.write_many(drag['nodes'],result)
         drag['final']=result;drag['changed']=not reset;self.tick()
         if not cmds.about(batch=True):cmds.refresh(currentView=True)
 
@@ -429,11 +430,11 @@ class Viewport(overlay.Overlay):
         self.snap_target=None
         if self.canvas is not None:self.canvas.update()
         if cancel:self.hide_angle()
-        if drag is None or not drag['changed'] or not cmds.objExists(drag['node']):return
-        with without_undo():plane.restore(drag['node'],drag['before'])
+        if drag is None or not drag['changed']:return
+        with without_undo():plane.restore_many(drag['before'])
         if not cancel:
             cmds.undoInfo(openChunk=True,chunkName='Mirror plane')
-            try:plane.write(drag['node'],drag['final'])
+            try:plane.write_many(drag['nodes'],drag['final'])
             finally:cmds.undoInfo(closeChunk=True)
         self.tick()
         if not cmds.about(batch=True):cmds.refresh(currentView=True)
@@ -525,6 +526,8 @@ class Viewport(overlay.Overlay):
                     control=picked[1];axis='XYZ'[control['axis']] if control['axis'] is not None else ''
                     label={'axis':'Плоскость '+axis,'direction':'Сменить сторону отражения '+axis+' ↔ −'+axis,
                            'move':'Переместить по '+axis,'rotate':'Повернуть вокруг '+axis,'free':'Переместить плоскость'}[control['kind']]
+                    if control['kind']=='direction' and cmds.nodeType(picked[0]['node'])!='modelPackMirrorCut':
+                        label='Ось отражения '+axis
                     QtWidgets.QToolTip.showText(event.globalPosition().toPoint(),label,parent)
                 else:QtWidgets.QToolTip.hideText()
         except (ValueError,RuntimeError) as error:

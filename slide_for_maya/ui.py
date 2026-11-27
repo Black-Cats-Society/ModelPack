@@ -14,8 +14,8 @@ from maya.api import OpenMaya as om
 from maya.api import OpenMayaUI as omui
 
 from .core import LiveEdit, SlideError, _EPS, _mesh_fn, _normal_distances, analyze_selection, apply
-from .bevel import LiveBevel, analyze_bevel_selection
-from .multiple import LiveMultiple, _matching_clone_side
+from .bevel import LiveBevel, analyze_bevel_selection, _use_native_bevel
+from .multiple import LiveMultiple, NativeSlideBevel, _hard_segments, _matching_clone_side, _preserve_hard_edges
 from . import edit_session
 
 
@@ -35,7 +35,7 @@ _BEVEL_DRAG_MODE = "uniform"
 _DRAG_COUNT = 1
 _BEVEL_DRAG_COUNT = 1
 _DRAG_BIAS_PERCENT = 50
-_BEVEL_DRAG_BIAS_PERCENT = 50
+_BEVEL_DRAG_BIAS_PERCENT = 20
 _DRAG_SENSITIVITY = 3.0
 
 
@@ -95,8 +95,7 @@ def _include_isolated_preview(state, temp):
 
 def _start_preview(state, side):
     with _without_undo():
-        temp = (edit_session.preview(state) if state.get('editing') else
-                cmds.duplicate(state["mesh"], returnRootsOnly=True)[0])
+        temp = edit_session.preview(state)
         state["temp"] = temp
         try:
             _include_isolated_preview(state, temp)
@@ -106,7 +105,7 @@ def _start_preview(state, side):
         except Exception:
             _discard_preview(state)
             raise
-    if state["count"] > 1:
+    if state["count"] > 1 or state.get("native_bevel"):
         state["side"] = side
         return
     if state.get("bevel"):
@@ -152,12 +151,12 @@ def show():
     cmds.text(label="Выделите ребро, открытую цепочку или петлю", align="left")
     cmds.radioButtonGrp(_SIDE, label="Сторона", numberOfRadioButtons=2, labelArray2=("0", "1"), select=1)
     cmds.optionMenuGrp(_MODE, label="Смещение")
-    cmds.menuItem(label="Пропорционально")
-    cmds.menuItem(label="Равная ширина")
+    cmds.menuItem(label='Relative')
+    cmds.menuItem(label='Uniform Width')
     cmds.optionMenuGrp(_MODE, edit=True, select=2)
     cmds.setParent(column)
     cmds.floatFieldGrp(_AMOUNT, label="Значение", numberOfFields=1, value1=0.25)
-    cmds.button(label="Применить", command=_run_from_window)
+    cmds.button(label='Apply', command=_run_from_window)
     cmds.button(label="Инструмент перетаскивания", command=lambda *_: activate_drag())
     cmds.text(label="Направление мыши выбирает сторону; Shift позволяет выделять рёбра.", align="left")
     cmds.showWindow(window)
@@ -225,6 +224,23 @@ def _choose_bevel_by_drag(delta, guide, plan, mode):
     return relative * width if width is not None else None
 
 
+def _new_bevel_state(plan, mode):
+    return {
+        "bevel": True, "bevel_plan": plan, "mode": mode,
+        "native_bevel": plan.has_ngon_turn,
+        "hard_segments": _hard_segments(plan.mesh),
+        "count": _BEVEL_DRAG_COUNT, "bias_percent": _BEVEL_DRAG_BIAS_PERCENT,
+        "follow_width": True,
+        "multi_amount": None, "live": None, "side": None, "temp": None,
+        "guide_index": None, "mesh": plan.mesh, "context": cmds.currentCtx(),
+        "selection": cmds.ls(selection=True, flatten=True, long=True),
+        "hilite": cmds.ls(hilite=True, long=True) or [],
+        "visible": cmds.getAttr(plan.mesh + ".visibility"),
+        "base_mesh": edit_session.snapshot(plan.mesh),
+        "base_materials": edit_session.materials(plan.mesh),
+    }
+
+
 def _on_press(bevel=False):
     global _STATE, _LAST_SHIFT_CLICK
     _on_finalize(clear_selection_click=False,keep_session=True)
@@ -273,17 +289,8 @@ def _on_press(bevel=False):
         except RuntimeError as exc:
             cmds.warning(f"Slide Bevel: не удалось получить проекцию viewport: {exc}")
             return
-        _STATE = {
-            "bevel": True, "bevel_plan": plan, "guides": guides, "mode": mode,
-            "count": count, "bias_percent": bias_percent, "multi_amount": None,
-            "live": None, "side": None, "temp": None, "guide_index": None,
-            "anchor": (anchor[0], anchor[1]), "mesh": plan.mesh, "context": context,
-            "selection": cmds.ls(selection=True, flatten=True, long=True),
-            "hilite": cmds.ls(hilite=True, long=True) or [],
-            "visible": cmds.getAttr(plan.mesh + ".visibility"),
-        }
-        _STATE['base_mesh']=edit_session.snapshot(plan.mesh)
-        _STATE['base_materials']=edit_session.materials(plan.mesh)
+        _STATE = _new_bevel_state(plan, mode)
+        _STATE.update(guides=guides, anchor=tuple(anchor[:2]))
         return
     plans = {}
     errors = []
@@ -332,6 +339,7 @@ def _update_multi_preview(state, amount, side):
                           state["plans"][side].edge_ids)
             cmds.select([f"{state['temp']}.e[{edge}]" for edge in source_ids], replace=True)
             preview_side = side or 0
+            spacing = state.get("row_spacing")
             if not state.get("bevel"):
                 original_ids = {int(component.rsplit("[", 1)[1][:-1])
                                 for component in state["selection"]}
@@ -339,14 +347,104 @@ def _update_multi_preview(state, amount, side):
                     preview_side = _matching_clone_side(state["plans"][side])
             state["live"] = LiveMultiple(
                 bevel=bool(state.get("bevel")), count=state["count"],
-                mode=state["mode"], side=preview_side, bias_percent=state["bias_percent"])
+                mode=state["mode"], side=preview_side, bias_percent=state["bias_percent"],
+                spacing=spacing, follow_width=state.get("follow_width", False) and spacing is None)
         state["multi_amount"] = state["live"].update(amount)
     state["requested_amount"] = amount
 
 
+def _update_bevel_preview(state, amount):
+    starting = state["temp"] is None
+    if starting:
+        state["native_bevel"] = _use_native_bevel(state["bevel_plan"], state["count"])
+    if state.get("native_bevel"):
+        if starting:
+            _start_preview(state, None)
+            spacing = state.get("row_spacing")
+            with _without_undo():
+                state["live"] = NativeSlideBevel(
+                    state["temp"], state["bevel_plan"].edge_ids, state["mode"],
+                    state["count"], state["bias_percent"],
+                    spacing=spacing, follow_width=state.get("follow_width", False) and spacing is None,
+                )
+        with _without_undo():
+            state["live"].update(amount)
+        return
+    if state["count"] > 1:
+        _update_multi_preview(state, amount, None)
+        return
+    if state["temp"] is None:
+        _start_preview(state, None)
+    with _without_undo():
+        state["live"].update(amount)
+
+
+def bevel_width_state(selection):
+    """Return the active bevel's plan and current width in its own mode."""
+    if _STATE is not None and _STATE.get("bevel"):
+        live = _STATE["live"]
+        if live is not None and live.actual is not None:
+            return _STATE["bevel_plan"], _STATE["mode"], live.actual
+    if (_SESSION is not None and _SESSION.get("bevel") and
+            _SESSION["result_selection"] == selection):
+        return _SESSION["bevel_plan"], _SESSION["mode"], _SESSION["actual"]
+    return None
+
+
+def set_bevel_width(amount, mode, *, dragging=False):
+    """Create or resize a cut using the same preview as a viewport drag."""
+    global _STATE
+    if amount <= _EPS:
+        finish_bevel_width(cancel=True)
+        return
+    if _STATE is not None and not _STATE.get("panel_width"):
+        return
+    try:
+        if _STATE is None:
+            _check_session_selection()
+            if _SESSION is not None and _SESSION.get("bevel"):
+                if mode == _SESSION["mode"] and math.isclose(amount, _SESSION["actual"]):
+                    return
+                _STATE = edit_session.clone_state(_SESSION)
+                _STATE["selection"] = cmds.ls(selection=True, flatten=True, long=True)
+                _STATE["hilite"] = cmds.ls(hilite=True, long=True) or []
+            else:
+                _STATE = _new_bevel_state(analyze_bevel_selection(), mode)
+                _STATE["direction"] = 1
+            _STATE.update(panel_width=True, mode=mode, count=_BEVEL_DRAG_COUNT,
+                          bias_percent=_BEVEL_DRAG_BIAS_PERCENT, context=cmds.currentCtx())
+        _update_bevel_preview(_STATE, amount)
+        if dragging:
+            cmds.refresh(currentView=True)
+        else:
+            finish_bevel_width()
+    except Exception as exc:
+        finish_bevel_width(cancel=True)
+        cmds.warning(f"Slide Bevel: {exc}")
+
+
+def finish_bevel_width(*, cancel=False):
+    global _STATE
+    if _STATE is None or not _STATE.get("panel_width"):
+        return
+    state = _STATE
+    _STATE = None
+    state.pop("panel_width")
+    try:
+        if cancel:
+            if state["temp"] is not None:
+                _discard_preview(state)
+        elif state["live"] is not None:
+            _publish_session(state)
+    except Exception as exc:
+        if state["temp"] is not None:
+            _discard_preview(state)
+        cmds.warning(f"Slide Bevel: {exc}")
+
+
 def _on_drag():
     global _STATE
-    if _STATE is None:
+    if _STATE is None or _STATE.get("panel_width"):
         return
     if "select_anchor" in _STATE:
         point = cmds.draggerContext(_STATE["context"], query=True, dragPoint=True)
@@ -378,19 +476,7 @@ def _on_drag():
                 cmds.refresh(force=True, currentView=True)
             return
         try:
-            if _STATE["count"] > 1:
-                _update_multi_preview(_STATE, amount, None)
-                cmds.refresh(force=True, currentView=True)
-                return
-            first = _STATE["temp"] is None
-            if first:
-                _start_preview(_STATE, None)
-            with _without_undo():
-                _STATE["live"].update(amount)
-                if first:
-                    cmds.select([f"{_STATE['temp']}.e[{edge}]" for edge in
-                                 _STATE["live"]._new_edges],
-                                replace=True)
+            _update_bevel_preview(_STATE, amount)
         except Exception as exc:
             try:
                 _discard_preview(_STATE)
@@ -598,7 +684,7 @@ def _select_from_screen(anchor, end, *, context=None, button=1, clicked_at=None)
 
 def _on_release():
     global _STATE
-    if _STATE is None:
+    if _STATE is None or _STATE.get("panel_width"):
         return
     if "select_anchor" in _STATE:
         state = _STATE
@@ -716,7 +802,10 @@ def _publish_session(state):
     try:
         actual=state['live'].actual
         live=state['live'];side=state['side'];guide_index=state.get('guide_index')
-        if state['count']>1:edges=live.new_edges
+        if state.get('bevel'):
+            state['follow_width'] = False
+            state['row_spacing'] = getattr(live, 'spacing', None)
+        if state['count']>1 or state.get('native_bevel'):edges=live.new_edges
         elif state.get('bevel'):edges=live._new_edges
         else:
             def pairs(edit):
@@ -726,6 +815,9 @@ def _publish_session(state):
             fn=_mesh_fn(state['temp'])
             mapping={frozenset(fn.getEdgeVertices(edge)):edge for edge in range(fn.numEdges)}
             edges=[mapping[frozenset(pair)] for pair in pairs(live)]
+        if state.get('bevel'):
+            with _without_undo():
+                _preserve_hard_edges(state['temp'], state.get('hard_segments', ()))
         data=edit_session.snapshot(state['temp']);shading=edit_session.materials(state['temp'])
         _discard_preview(state)
         state.update(actual=actual,side=side,guide_index=guide_index)
@@ -749,13 +841,19 @@ def _update_session_settings(bevel=False):
                  bias_percent=_BEVEL_DRAG_BIAS_PERCENT if bevel else _DRAG_BIAS_PERCENT)
     if all(state[key]==_SESSION[key] for key in ('mode','count','bias_percent')):return
     amount=_SESSION['actual']
+    if state['bias_percent'] != _SESSION['bias_percent'] or _SESSION['count'] == 1:
+        state['row_spacing'] = None
     if state['mode']!=_SESSION['mode']:
         plans=state['bevel_plan'].runs if bevel else (state['plans'][_SESSION['side']],)
         width=min((distance for plan in plans for distance in _normal_distances(plan) if distance>_EPS),default=1.)
         amount=amount*width if state['mode']=='uniform' else amount/width
+        spacing = state.get('row_spacing')
+        if spacing is not None:
+            state['row_spacing'] = spacing * width if state['mode'] == 'uniform' else spacing / width
     _SESSION_UPDATING=True
     try:
-        if state['count']>1:_update_multi_preview(state,amount,_SESSION['side'])
+        if bevel:_update_bevel_preview(state,amount)
+        elif state['count']>1:_update_multi_preview(state,amount,_SESSION['side'])
         else:
             _start_preview(state,_SESSION['side'])
             with _without_undo():state['live'].update(amount)
@@ -831,18 +929,25 @@ def set_edge_distribution(percent, *, bevel=False):
     _update_session_settings(bevel)
 
 
+def set_bevel_mode(mode, *, update=True):
+    global _BEVEL_DRAG_MODE
+    if mode not in ("relative", "uniform"):
+        raise SlideError("Режим должен быть relative или uniform.")
+    _BEVEL_DRAG_MODE = mode
+    if update:
+        _update_session_settings(True)
+
+
 def activate_bevel_drag(mode=None, count=None):
     """Activate the two-sided drag tool, including branching selections."""
-    global _BEVEL_DRAG_MODE
     was_active=active_bevel()
     if mode is not None:
-        if mode not in ("relative", "uniform"):
-            raise SlideError("Режим должен быть relative или uniform.")
-        _BEVEL_DRAG_MODE = mode
+        set_bevel_mode(mode, update=False)
     if count is not None:
         set_edge_count(count, bevel=True)
     if was_active and (_STATE is None or _STATE.get('context')==_BEVEL_CONTEXT):
-        if mode is not None:_update_session_settings(True)
+        if mode is not None:
+            _update_session_settings(True)
         return _BEVEL_CONTEXT
     prefix = "import slide_for_maya.ui as slide_ui; slide_ui."
     callbacks = dict(

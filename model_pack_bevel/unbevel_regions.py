@@ -6,8 +6,138 @@ does not assume a rectangular grid or need the bevel's construction history.
 import heapq
 import itertools
 import math
+from collections import defaultdict
+
+import numpy as np
 from maya.api import OpenMaya as om
 from slide_for_maya.core import _mesh_fn
+
+
+def prepare_quad_network(mesh, face_ids, *, details=None, mesh_fn=None, mesh_points=None):
+    """Recover intersecting quad ribbons using local, rather than global, planes."""
+    fn = mesh_fn if mesh_fn is not None else _mesh_fn(mesh)
+    points = mesh_points if mesh_points is not None else fn.getPoints(om.MSpace.kWorld)
+    selected = set(face_ids)
+    polygon = om.MItMeshPolygon(fn.dagPath())
+    iterator = om.MItMeshEdge(fn.dagPath())
+    face_edges = {}
+    edge_faces = {}
+    vertices = {}
+    for face in sorted(selected):
+        polygon.setIndex(face)
+        vertices[face] = list(polygon.getVertices())
+        edges = list(polygon.getEdges())
+        if len(edges) != 4:
+            raise ValueError("Сеть фасок должна состоять из квадов.")
+        face_edges[face] = edges
+        for edge in edges:
+            if edge not in edge_faces:
+                iterator.setIndex(edge)
+                edge_faces[edge] = list(iterator.getConnectedFaces())
+                if len(edge_faces[edge]) != 2:
+                    raise ValueError("Сеть фасок должна лежать на замкнутом участке сетки.")
+    boundary = {edge for edge, faces in edge_faces.items() if len(selected.intersection(faces)) == 1}
+    walks = []
+    shortest = {}
+    for start in sorted(boundary):
+        face = next(f for f in edge_faces[start] if f in selected)
+        edge = start
+        trail = {}
+        while face in selected and face not in trail:
+            edges = face_edges[face]
+            index = edges.index(edge)
+            trail[face] = (edges[(index+1)%4], edges[(index+3)%4])
+            edge = edges[(index+2)%4]
+            face = next(f for f in edge_faces[edge] if f != face)
+        if face in selected or edge <= start:
+            continue
+        walks.append(trail)
+        for f in trail:
+            shortest[f] = min(shortest.get(f, math.inf), len(trail))
+
+    parent = {vertex: vertex for face in vertices.values() for vertex in face}
+
+    def root(vertex):
+        while parent[vertex] != vertex:
+            parent[vertex] = parent[parent[vertex]]
+            vertex = parent[vertex]
+        return vertex
+
+    def join(a, b):
+        parent[root(b)] = root(a)
+
+    covered = set()
+    for trail in walks:
+        if any(shortest[f] < len(trail) for f in trail):
+            continue
+        covered.update(trail)
+        for transverse in trail.values():
+            for edge in transverse:
+                join(*fn.getEdgeVertices(edge))
+
+    remaining = selected - covered
+    if not covered or not remaining:
+        raise ValueError("Не найдены полосы с угловыми стыками.")
+    while remaining:
+        pending = [remaining.pop()]
+        for face in pending:
+            neighbors = {f for edge in face_edges[face] for f in edge_faces[edge]} & remaining
+            pending.extend(sorted(neighbors))
+            remaining.difference_update(neighbors)
+        junction = {v for face in pending for v in vertices[face]}
+        anchor = min(junction)
+        for vertex in sorted(junction):
+            join(anchor, vertex)
+
+    rows_by_root = defaultdict(list)
+    for vertex in sorted(parent):
+        rows_by_root[root(vertex)].append(vertex)
+    constraints = defaultdict(set)
+    for edge in boundary:
+        support = next(f for f in edge_faces[edge] if f not in selected)
+        a, b = fn.getEdgeVertices(edge)
+        for vertex in (a, b):
+            constraints[root(vertex)].add((support, vertex))
+
+    rows = list(rows_by_root.values())
+    centers = []
+    for row in rows:
+        origin = np.mean([tuple(points[v])[:3] for v in row], axis=0)
+        normals, offsets = [], []
+        for support, vertex in sorted(constraints[root(row[0])]):
+            normal = np.asarray(tuple(fn.getPolygonNormal(support, om.MSpace.kWorld).normal()))
+            normals.append(normal)
+            offsets.append(normal @ (np.asarray(tuple(points[vertex])[:3]) - origin))
+        if not normals:
+            raise ValueError("Не найдены опорные поверхности вокруг стыка.")
+        # Discard nearly parallel constraints as independent directions.
+        # Their slight disagreement is common on curved FBX panels.
+        delta, _, rank, _ = np.linalg.lstsq(normals, offsets, rcond=.035)
+        radius = max(np.linalg.norm(np.asarray(tuple(points[v])[:3])-origin) for v in row)
+        if rank < 2 or np.linalg.norm(delta) > 4*radius:
+            raise ValueError("Не удалось восстановить локальное ребро фаски.")
+        centers.append(om.MPoint(*(origin+delta)))
+
+    if any(len({root(v) for v in face}) > 2 for face in vertices.values()):
+        raise ValueError("Выделение содержит грани, не принадлежащие фаске.")
+    # A valid collapse keeps each surviving polygon simple and every
+    # reconstructed seam incident to exactly two surviving polygons.
+    seam = {tuple(sorted(root(v) for v in fn.getEdgeVertices(edge))) for edge in boundary}
+    seam = {edge for edge in seam if edge[0] != edge[1]}
+    incidence = defaultdict(int)
+    affected = {f for pairs in constraints.values() for f, _ in pairs}
+    for face in affected:
+        mapped = [root(v) if v in parent else v for v in fn.getPolygonVertices(face)]
+        ids = [v for i, v in enumerate(mapped) if v != mapped[i-1]]
+        if len(ids) < 3 or len(set(ids)) != len(ids):
+            raise ValueError("Стык вырождает соседнюю поверхность.")
+        for a, b in zip(ids, ids[1:] + ids[:1]):
+            incidence[tuple(sorted((a, b)))] += 1
+    if any(incidence[edge] != 2 for edge in seam):
+        raise ValueError("Восстановленные рёбра не образуют замкнутый стык.")
+    if details is not None:
+        details.update(fans=[], regions=[dict(faces=sorted(selected), vertices=sorted(parent), quad_network=True)])
+    return centers, rows, [.5] * len(rows)
 
 
 def _intersection(planes, ids, origin, tolerance):

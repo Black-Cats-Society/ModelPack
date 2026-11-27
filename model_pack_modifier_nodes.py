@@ -24,41 +24,27 @@ def _finish(data,plug,attr,output):
     data.outputValue(attr).setMObject(output);data.setClean(plug)
 
 
-def _triangulate_caps(output,caps):
-    source=om.MFnMesh(output);cap_set=set(caps)
-    counts,vertices=source.getVertices();uvcounts,uvids=source.getAssignedUVs()
-    tris,tri_vertices=source.getTriangles()
-    result_counts=[];result_vertices=[];result_uv=[];cap_faces=set();vptr=uptr=tptr=0
-    for face,count in enumerate(counts):
-        polygon=list(vertices[vptr:vptr+count]);uv=list(uvids[uptr:uptr+uvcounts[face]])
-        if face in cap_set:
-            by_vertex=dict(zip(polygon,uv))
-            for i in range(tris[face]):
-                triangle=list(tri_vertices[tptr+i*3:tptr+(i+1)*3])
-                cap_faces.add(len(result_counts));result_counts.append(3)
-                result_vertices.extend(triangle);result_uv.extend(by_vertex[v] for v in triangle)
-        else:
-            result_counts.append(count);result_vertices.extend(polygon);result_uv.extend(uv)
-        vptr+=count;uptr+=uvcounts[face];tptr+=tris[face]*3
-    data=om.MFnMeshData().create();fn=om.MFnMesh()
-    fn.create(source.getPoints(),result_counts,result_vertices,parent=data)
-    u,v=source.getUVs();unique={};new_u=[];new_v=[];mapping=[]
+def _finish_tube_mesh(output,caps):
+    """Keep each closed end as one polygon; weld UVs and shade its rim."""
+    fn=om.MFnMesh(output);cap_faces=set(caps)
+    counts,vertices=fn.getVertices();uvcounts,uvids=fn.getAssignedUVs()
+    u,v=fn.getUVs();unique={};new_u=[];new_v=[];mapping=[]
     for a,b in zip(u,v):
         key=round(a,9),round(b,9)
         if key not in unique:
             unique[key]=len(new_u);new_u.append(a);new_v.append(b)
         mapping.append(unique[key])
-    fn.setUVs(new_u,new_v);fn.assignUVs(result_counts,[mapping[i] for i in result_uv])
+    fn.clearUVs();fn.setUVs(new_u,new_v);fn.assignUVs(uvcounts,[mapping[i] for i in uvids])
     neighbors={};ptr=0
-    for face,count in enumerate(result_counts):
-        polygon=result_vertices[ptr:ptr+count];ptr+=count
+    for face,count in enumerate(counts):
+        polygon=list(vertices[ptr:ptr+count]);ptr+=count
         for a,b in zip(polygon,polygon[1:]+polygon[:1]):neighbors.setdefault(frozenset((a,b)),[]).append(face)
     for edge in range(fn.numEdges):
         faces=neighbors[frozenset(fn.getEdgeVertices(edge))]
         cap_neighbors=sum(f in cap_faces for f in faces)
         fn.setEdgeSmoothing(edge,not(cap_neighbors==1))
     fn.cleanupEdgeSmoothing()
-    return data
+    return output
 
 
 class ResetTubeNode(om.MPxNode):
@@ -80,9 +66,20 @@ class ResetTubeNode(om.MPxNode):
         source=data.inputValue(cls.inputMesh).asMesh()
         if source.isNull():return
         from tube_resection import _resection_data
+        fn=om.MFnDependencyNode(self.thisMObject())
+        segments=data.inputValue(fn.attribute('lengthSegments')).asInt() if fn.hasAttribute('lengthSegments') else 0
+        angle=None;extra=0
+        if fn.hasAttribute('reduceByAngle'):
+            segments=0
+            if data.inputValue(fn.attribute('reduceByAngle')).asBool():angle=data.inputValue(fn.attribute('reductionAngle')).asDouble()
+            extra=data.inputValue(fn.attribute('extraLoops')).asInt()
         output,_,_,_,caps,_=_resection_data(source,json.loads(data.inputValue(cls.seam).asString()),
-                                           data.inputValue(cls.sides).asInt(),matrix=data.inputValue(cls.matrix).asMatrix())
-        _finish(data,plug,cls.outputMesh,_triangulate_caps(output,caps))
+                                           data.inputValue(cls.sides).asInt(),matrix=data.inputValue(cls.matrix).asMatrix(),length_segments=segments,reduction_angle=angle,extra_loops=extra)
+        _finish(data,plug,cls.outputMesh,_finish_tube_mesh(output,caps))
+
+    def setDependentsDirty(self,plug,affected):
+        if om.MFnAttribute(plug.attribute()).name in ('lengthSegments','reduceByAngle','reductionAngle','extraLoops'):
+            affected.append(om.MPlug(self.thisMObject(),type(self).outputMesh))
 
 
 class SlideResultNode(om.MPxNode):
@@ -106,6 +103,30 @@ class SlideResultNode(om.MPxNode):
         _finish(data,plug,cls.outputMesh,result)
 
 
+class CylinderCapsNode(om.MPxNode):
+    name='modelPackCylinderCaps';id=om.MTypeId(0x0013B2F5)
+    @staticmethod
+    def creator():return CylinderCapsNode()
+    @staticmethod
+    def initialize():
+        cls=CylinderCapsNode
+        _mesh_attr(cls,'inputMesh','in')
+        _mesh_attr(cls,'outputMesh','out',True)
+        enum=om.MFnEnumAttribute();cls.capType=enum.create('capType','cap',0)
+        for value,label in enumerate(('Cap','Center','Parallel')):enum.addField(label,value)
+        enum.keyable=True;cls.addAttribute(cls.capType)
+        cls.attributeAffects(cls.inputMesh,cls.outputMesh)
+        cls.attributeAffects(cls.capType,cls.outputMesh)
+    def compute(self,plug,data):
+        cls=type(self)
+        if plug!=cls.outputMesh:return None
+        source=data.inputValue(cls.inputMesh).asMesh()
+        if source.isNull():return
+        from model_pack_draft.cylinder_caps import evaluate
+        output=evaluate(source,data.inputValue(cls.capType).asShort())
+        _finish(data,plug,cls.outputMesh,output)
+
+
 class SetSlideResult(om.MPxCommand):
     @staticmethod
     def creator():return SetSlideResult()
@@ -124,7 +145,7 @@ class SetSlideResult(om.MPxCommand):
 
 def initializePlugin(plugin):
     fn=om.MFnPlugin(plugin,'Model Pack','1.0','Any')
-    for cls in (ResetTubeNode,SlideResultNode):fn.registerNode(cls.name,cls.id,cls.creator,cls.initialize)
+    for cls in (ResetTubeNode,SlideResultNode,CylinderCapsNode):fn.registerNode(cls.name,cls.id,cls.creator,cls.initialize)
     fn.registerCommand('modelPackSetSlideResult',SetSlideResult.creator)
     from model_pack_mirror_session import MirrorEditCommand,MirrorApplyCommand
     fn.registerCommand('modelPackMirrorEdit',MirrorEditCommand.creator)
@@ -136,4 +157,4 @@ def uninitializePlugin(plugin):
     fn.deregisterCommand('modelPackSetSlideResult')
     fn.deregisterCommand('modelPackMirrorEdit')
     fn.deregisterCommand('modelPackApplyMirror')
-    for cls in (ResetTubeNode,SlideResultNode):fn.deregisterNode(cls.id)
+    for cls in (CylinderCapsNode,ResetTubeNode,SlideResultNode):fn.deregisterNode(cls.id)

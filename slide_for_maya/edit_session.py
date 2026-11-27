@@ -19,13 +19,16 @@ def snapshot(mesh):
 
 def preview(state):
     """Create a disposable mesh from the source before this operation."""
-    data=state['base_mesh'];mesh=state['mesh']
-    temp=cmds.createNode('transform',name='modelPackSlidePreview#')
-    sel=om.MSelectionList();sel.add(temp)
-    om.MFnMesh().copy(data,sel.getDependNode(0))
-    cmds.xform(temp,worldSpace=True,matrix=cmds.xform(mesh,q=True,worldSpace=True,matrix=True))
-    shaders,assignments=state['base_materials']
-    assign_materials(temp,shaders,assignments)
+    matrix = _mesh_fn(state['mesh']).dagPath().inclusiveMatrix()
+    temp = cmds.createNode('transform', name='modelPackSlidePreview#')
+    try:
+        parent = om.MSelectionList().add(temp).getDependNode(0)
+        om.MFnMesh().copy(state['base_mesh'], parent)
+        cmds.xform(temp, worldSpace=True, matrix=list(matrix))
+        assign_materials(temp, *state['base_materials'])
+    except Exception:
+        cmds.delete(temp)
+        raise
     return temp
 
 
@@ -61,6 +64,7 @@ def publish(state,data,shading,edges):
         assign_materials(mesh,*shading)
         cmds.select([f'{mesh}.e[{edge}]' for edge in edges],r=True)
         info={key:state.get(key) for key in ('actual','mode','count','bias_percent','side','guide_index','direction')}
+        info['row_spacing'] = state.get('row_spacing')
         info['result_selection']=selection_key()
         cmds.setAttr(node+'.slideState',json.dumps(info),type='string')
     finally:cmds.undoInfo(closeChunk=True)
@@ -78,4 +82,7 @@ def clone_state(session):
     state['editing']=True
     state['base_amount']=session['actual']
     state['base_side']=session['side']
+    if (session.get('bevel') and session['count'] > 1
+            and session.get('row_spacing') is None):
+        state['row_spacing'] = session['actual'] * session['bias_percent'] / 100.
     return state

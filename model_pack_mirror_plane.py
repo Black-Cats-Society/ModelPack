@@ -1,4 +1,5 @@
 """World-space reflection frames shared by the viewport and mirror histories."""
+import math
 from maya import cmds
 from maya.api import OpenMaya as om
 from slide_for_maya.core import _mesh_fn
@@ -109,6 +110,70 @@ def restore(node,state):
             mirror_duplicate(source(node),cmds.getAttr(node+'.modelPackAxis'),cmds.getAttr(node+'.modelPackSpace'))
 
 
+def manipulator_pivot():
+    """Capture Maya's current world pivot before the toolbox changes context."""
+    context=cmds.currentCtx()
+    tools={'moveSuperContext':(cmds.manipMoveContext,'Move'),
+           'RotateSuperContext':(cmds.manipRotateContext,'Rotate'),
+           'scaleSuperContext':(cmds.manipScaleContext,'Scale')}
+    entry=tools.get(context)
+    if entry is None:return None
+    command,name=entry
+    try:point=command(name,query=True,position=True)
+    except (RuntimeError,TypeError):return None
+    if not point or len(point)<3 or not all(math.isfinite(v) for v in point[:3]):return None
+    return [om.MDistance(v,om.MDistance.uiUnit()).asCentimeters() for v in point[:3]]
+
+
+def selection_frames(meshes,pivot=None):
+    """One selection center, with world or active-object rotation (no scale)."""
+    if pivot is None:
+        bounds=cmds.exactWorldBoundingBox(meshes)
+        center=[om.MDistance((bounds[i]+bounds[i+3])*.5,om.MDistance.uiUnit()).asCentimeters() for i in range(3)]
+    else:center=list(pivot)
+    active_world=_mesh_fn(meshes[-1]).dagPath().inclusiveMatrix()
+    local=om.MTransformationMatrix(active_world).rotation(asQuaternion=True).asMatrix()
+    result={}
+    for space,pose in ((0,om.MMatrix()),(1,local)):
+        values=list(pose);values[12:15]=center if space else [0.,0.,0.];result[space]=om.MMatrix(values)
+    return result
+
+
+def automatic_direction(nodes):
+    """Keep the occupied half only when the entire input is on one side."""
+    distances=[]
+    for node in nodes:
+        if cmds.nodeType(node)!='modelPackMirrorCut':continue
+        selection=om.MSelectionList();selection.add(node)
+        dependency=om.MFnDependencyNode(selection.getDependNode(0))
+        incoming=om.MFnMesh(dependency.findPlug('inputMesh',False).asMObject())
+        world=_mesh_fn(source(node)).dagPath().inclusiveMatrix()
+        inverse=frame(node).inverse();axis=cmds.getAttr(node+'.axis')
+        distances.extend((point*world*inverse)[axis] for point in incoming.getPoints())
+    if not distances:return None
+    tolerance=max(1e-7,max(map(abs,distances))*1e-8)
+    positive=any(d>tolerance for d in distances);negative=any(d<-tolerance for d in distances)
+    if positive==negative:return None
+    value=1 if positive else 0
+    for node in nodes:
+        if cmds.getAttr(node+'.direction')!=value:cmds.setAttr(node+'.direction',value)
+    return value
+
+
+def write_many(nodes,pose):
+    for node in dict.fromkeys(nodes):
+        if cmds.objExists(node):write(node,pose)
+
+
+def snapshot_many(nodes):
+    return {node:snapshot(node) for node in nodes if cmds.objExists(node)}
+
+
+def restore_many(states):
+    for node,state in states.items():
+        if cmds.objExists(node):restore(node,state)
+
+
 def basis(pose):return [om.MVector(*list(pose)[i*4:i*4+3]) for i in range(3)]
 def origin(pose):return om.MVector(*list(pose)[12:15])
 
@@ -124,10 +189,13 @@ def rotated(pose,axis,angle):
 
 
 def bounds(node,pose):
-    mesh=source(node);fn=_mesh_fn(mesh);box=om.MFnDagNode(fn.dagPath()).boundingBox
-    low,high=box.min,box.max;world=fn.dagPath().inclusiveMatrix();inverse=pose.inverse()
-    points=[om.MPoint(x,y,z)*world*inverse for x in (low.x,high.x) for y in (low.y,high.y) for z in (low.z,high.z)]
-    axis=cmds.getAttr(node+'.'+fields(node)[0]);flat=[i for i in range(3) if i!=axis]
+    nodes=[node] if isinstance(node,str) else node
+    points=[];inverse=pose.inverse()
+    for item in nodes:
+        mesh=source(item);fn=_mesh_fn(mesh);box=om.MFnDagNode(fn.dagPath()).boundingBox
+        low,high=box.min,box.max;world=fn.dagPath().inclusiveMatrix()
+        points.extend(om.MPoint(x,y,z)*world*inverse for x in (low.x,high.x) for y in (low.y,high.y) for z in (low.z,high.z))
+    axis=cmds.getAttr(nodes[0]+'.'+fields(nodes[0])[0]);flat=[i for i in range(3) if i!=axis]
     ranges=[(min(p[i] for p in points),max(p[i] for p in points)) for i in flat]
     size=max((b-a for a,b in ranges),default=1.);size=max(size,1e-4);padding=size*.08
     corners=[]

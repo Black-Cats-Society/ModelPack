@@ -115,8 +115,38 @@ def _overlap(a,b):
     return all(a[i]<=b[i+3] and b[i]<=a[i+3] for i in range(3))
 
 
+def _cubic_root_array(coefficients):
+    """Bisect the monotone intervals between derivative roots in one batch."""
+    c = coefficients
+    derivative = np.column_stack((c[:, 1], 2. * c[:, 2], 3. * c[:, 3], np.zeros(len(c))))
+    critical = np.minimum(np.sort(_root_array(derivative), axis=1)[:, :2], 1.)
+    critical[np.abs(derivative).max(axis=1) < 1e-18] = 1.
+    bounds = np.column_stack((np.zeros(len(c)), critical, np.ones(len(c))))
+    values = ((c[:, 3, None] * bounds + c[:, 2, None]) * bounds +
+              c[:, 1, None]) * bounds + c[:, 0, None]
+    tolerance = np.abs(c).max(axis=1) * 1e-10
+    tangent = np.where(np.abs(values[:, 1:]) < tolerance[:, None], bounds[:, 1:], np.inf)
+    rows, intervals = np.nonzero(values[:, :-1] * values[:, 1:] < 0.)
+    low, high = bounds[rows, intervals], bounds[rows, intervals + 1]
+    first = values[rows, intervals]
+    a, b, cc, d = c[rows].T
+    for _ in range(42):
+        middle = (low + high) * .5
+        value = ((d * middle + cc) * middle + b) * middle + a
+        left = first * value <= 0.
+        high = np.where(left, middle, high)
+        low = np.where(left, low, middle)
+        first = np.where(left, first, value)
+    crossing = np.full((len(c), 3), np.inf)
+    crossing[rows, intervals] = (low + high) * .5
+    roots = np.sort(np.concatenate((tangent, crossing), axis=1), axis=1)
+    roots[:, 1:] = np.where(roots[:, 1:] == roots[:, :-1], np.inf, roots[:, 1:])
+    roots[roots <= 1e-7] = np.inf
+    return np.sort(roots, axis=1)
+
+
 def _root_array(coefficients):
-    """Batch linear/quadratic roots; solve the remaining cubics exactly."""
+    """Batch the real roots used for continuous contacts."""
     c = np.asarray(coefficients)
     result = np.full((len(c),3),math.inf)
     scale = np.max(np.abs(c),axis=1)
@@ -137,9 +167,15 @@ def _root_array(coefficients):
     control = np.column_stack((c[:,0],c[:,0]+c[:,1]/3,
                                c[:,0]+2*c[:,1]/3+c[:,2]/3,c.sum(axis=1)))
     cubic &= ((control.min(axis=1)<0)&(control.max(axis=1)>0))|(np.abs(c.sum(axis=1))<=scale*1e-10)
-    for i in np.flatnonzero(cubic):
-        roots = _roots(c[i])
-        result[i,:len(roots)] = roots
+    cubic_ids = np.flatnonzero(cubic & (scale >= 1e-18))
+    if len(cubic_ids):
+        roots = _cubic_root_array(c[cubic_ids])
+        # Near a multiple root the tolerance can introduce additional
+        # critical points to check, alongside the true crossing roots.
+        slots = max(3, np.isfinite(roots).sum(axis=1).max())
+        if slots > result.shape[1]:
+            result = np.pad(result, ((0, 0), (0, slots - result.shape[1])), constant_values=np.inf)
+        result[cubic_ids] = roots[:, :slots]
     result[(result<=1e-7)|(result>1)] = math.inf
     return result
 
@@ -163,7 +199,7 @@ def _batch_contact(pairs,points,motions,triangles,tolerance):
     roots = _root_array(coefficients)
     limits = np.full(len(p),math.inf)
     vertex_event = np.tile(np.arange(15)<6,len(pairs))
-    for column in range(3):
+    for column in range(roots.shape[1]):
         chosen = np.flatnonzero(np.isfinite(roots[:,column]))
         if not len(chosen): continue
         t = roots[chosen,column]
@@ -215,19 +251,7 @@ def _batch_contact(pairs,points,motions,triangles,tolerance):
     return values[closest],closest
 
 
-def first_contact(points,vectors,triangles,width,cache=None):
-    """First nonadjacent face contact along a linear width expansion."""
-    if cache is not None:
-        cache["contact_vertices"] = ()
-    if not triangles or width<=1e-12:
-        return math.inf,()
-    motions = [v*width for v in vectors]
-    tolerance = max(width*1e-8,1e-9)
-    positions = np.asarray([tuple(p)[:3] for p in points])
-    displacement = np.asarray([tuple(d) for d in motions])
-    indices = np.asarray([ids for ids,_ in triangles])
-    coordinates = np.concatenate((positions[indices],(positions+displacement)[indices]),axis=1)
-    exact_boxes = np.concatenate((coordinates.min(axis=1)-tolerance,coordinates.max(axis=1)+tolerance),axis=1)
+def _swept_planes(coordinates, tolerance):
     # Batch the convex swept-hull planes in NumPy, which ships with Maya.
     a,b,c = np.asarray(list(itertools.combinations(range(6),3))).T
     normals = np.cross(coordinates[:,b]-coordinates[:,a],coordinates[:,c]-coordinates[:,a])
@@ -243,7 +267,8 @@ def first_contact(points,vectors,triangles,width,cache=None):
     # A coplanar swept triangle has no 3D side faces. Include its in-plane
     # support directions too, otherwise unrelated cap sections all reach the
     # expensive continuous solver despite being visibly far apart.
-    base = normals[np.arange(len(triangles)),lengths.argmax(axis=1)]
+    count = len(coordinates)
+    base = normals[np.arange(count),lengths.argmax(axis=1)]
     ea,eb = np.asarray(list(itertools.combinations(range(6),2))).T
     lateral = np.cross(coordinates[:,eb]-coordinates[:,ea],base[:,None,:])
     lateral_lengths = np.linalg.norm(lateral,axis=2)
@@ -259,20 +284,34 @@ def first_contact(points,vectors,triangles,width,cache=None):
     normals = np.concatenate((normals,lateral),axis=1)
     offsets = np.concatenate((offsets,edge_offset),axis=1)
     # Coplanar combinations repeat the same support plane many times.
-    plane_ids = np.repeat(np.arange(len(triangles)),normals.shape[1])
+    plane_ids = np.repeat(np.arange(count),normals.shape[1])
     valid = np.isfinite(offsets.ravel())
     values = np.column_stack((plane_ids[valid],normals.reshape((-1,3))[valid],offsets.ravel()[valid]))
     _,unique = np.unique(np.round(values,9),axis=0,return_index=True)
     values = values[unique]
     owners = values[:,0].astype(int)
-    counts = np.bincount(owners,minlength=len(triangles))
+    counts = np.bincount(owners,minlength=count)
     size = int(counts.max(initial=0))
-    compressed_normals = np.zeros((len(triangles),size,3))
-    compressed_offsets = np.full((len(triangles),size),math.inf)
+    compressed_normals = np.zeros((count,size,3))
+    compressed_offsets = np.full((count,size),math.inf)
     columns = np.arange(len(owners))-np.repeat(np.cumsum(counts)-counts,counts)
     compressed_normals[owners,columns] = values[:,1:4]
     compressed_offsets[owners,columns] = values[:,4]
-    normals,offsets = compressed_normals,compressed_offsets
+    return compressed_normals, compressed_offsets
+
+
+def first_contact(points,vectors,triangles,width,cache=None,*,fraction_limit=1.):
+    """First nonadjacent face contact within a connected mesh shell."""
+    if cache is not None:
+        cache["contact_vertices"] = ()
+    if not triangles or width<=1e-12 or fraction_limit<=1e-7:
+        return math.inf,()
+    tolerance = max(width*1e-8,1e-9)
+    positions = np.asarray([tuple(p)[:3] for p in points])
+    displacement = np.asarray([tuple(v)[:3] for v in vectors]) * width
+    indices = np.asarray([ids for ids,_ in triangles])
+    coordinates = np.concatenate((positions[indices],(positions+displacement*fraction_limit)[indices]),axis=1)
+    exact_boxes = np.concatenate((coordinates.min(axis=1)-tolerance,coordinates.max(axis=1)+tolerance),axis=1)
     reuse = (cache is not None and "boxes" in cache and
              cache["topology"]==tuple(triangles) and
              np.all(exact_boxes[:,:3]>=cache["boxes"][:,:3]) and
@@ -295,36 +334,71 @@ def first_contact(points,vectors,triangles,width,cache=None):
                 vertex_faces.setdefault(vertex,set()).add(face)
         neighbors = {face:set().union(*(vertex_faces[v] for v in members))
                      for face,members in face_members.items()}
+        # Combine preserves separate shells, including overlapping parts.
+        # Native bevel operates on their topology independently. Such parts
+        # must not become collision obstacles merely by sharing a mesh node.
+        shells = {}
+        for face in face_members:
+            if face in shells:
+                continue
+            shells[face] = face
+            pending = [face]
+            for member in pending:
+                for other in neighbors[member]:
+                    if other not in shells:
+                        shells[other] = face
+                        pending.append(other)
         face_ids = np.asarray([face for ids,face in triangles])
-        pair_list=[]
-        # This vector comparison replaces repeated Python tree traversals.
-        for i,(first,face) in enumerate(triangles):
-            overlap = ((boxes[:,:3]<=boxes[i,3:])&(boxes[:,3:]>=boxes[i,:3])).all(axis=1)
-            overlap &= face_ids!=face
-            for j in np.flatnonzero(overlap[i+1:])+i+1:
-                second,other=triangles[j]
+        shell_ids = np.asarray([shells[face] for ids,face in triangles])
+        pair_list = []
+        axis = np.argmax(np.ptp(boxes[:, :3], axis=0))
+        order = np.argsort(boxes[:, axis])
+        end = np.searchsorted(boxes[order, axis], boxes[order, axis + 3], side='right')
+        remaining = [a for a in range(3) if a != axis]
+        low, high = boxes[:, remaining], boxes[:, np.array(remaining) + 3]
+        for slot, i in enumerate(order):
+            face = face_ids[i]
+            candidates = order[slot + 1:end[slot]]
+            overlap = ((low[candidates] <= high[i]) & (high[candidates] >= low[i])).all(axis=1)
+            overlap &= face_ids[candidates] != face
+            overlap &= shell_ids[candidates] == shell_ids[i]
+            for j in candidates[overlap]:
+                other = face_ids[j]
                 if other in neighbors[face]: continue
                 # Existing generated-corner adjacency at width zero is not
                 # a new contact. Include only unrelated source sections.
                 if origins[i].intersection(origins[j]): continue
-                pair_list.append((i,j))
-        pairs = np.asarray(pair_list,dtype=int).reshape((-1,2))
+                pair_list.append((min(i, j), max(i, j)))
+        # Keep tie-breaking independent of the chosen sweep axis.
+        pairs = np.asarray(sorted(pair_list), dtype=int).reshape((-1, 2))
         if cache is not None:
             cache.update(boxes=boxes,pairs=pairs,topology=tuple(triangles))
-    limit=math.inf
-    faces=()
     moving = (np.linalg.norm(displacement[indices],axis=2)>1e-12).any(axis=1)
     pairs = pairs[moving[pairs[:,0]]|moving[pairs[:,1]]]
+    # Only build hulls for triangles whose current, unpadded sweeps overlap.
+    # In a local contact sequence most triangles leave the broad phase early.
+    a,b = exact_boxes[pairs[:,0]],exact_boxes[pairs[:,1]]
+    overlap = ((a[:,:3]<=b[:,3:])&(a[:,3:]>=b[:,:3])).all(axis=1)
+    pairs = pairs[overlap]
+    if not len(pairs):
+        return math.inf, ()
+    used, compact = np.unique(pairs, return_inverse=True)
+    compact = compact.reshape(pairs.shape)
+    coordinates = coordinates[used]
+    normals, offsets = _swept_planes(coordinates, tolerance)
+    limit=math.inf
+    faces=()
     for start in range(0,len(pairs),2048):
-        firsts,seconds = pairs[start:start+2048].T
+        candidates = pairs[start:start+2048]
+        firsts,seconds = compact[start:start+2048].T
         separated = (np.einsum('jpk,jlk->jlp',coordinates[seconds],normals[firsts]).min(axis=2)>
                      offsets[firsts]+tolerance).any(axis=1)
         separated |= (np.einsum('jpk,jlk->jlp',coordinates[firsts],normals[seconds]).min(axis=2)>
                       offsets[seconds]+tolerance).any(axis=1)
-        selected = pairs[start:start+2048][~separated]
+        selected = candidates[~separated]
         if not len(selected): continue
         contact,closest = _batch_contact(selected,positions,displacement,triangles,tolerance)
-        if contact<limit:
+        if contact<limit and contact<=fraction_limit:
             i,j=selected[closest]
             limit,faces=contact,(triangles[i][1],triangles[j][1])
             if cache is not None:

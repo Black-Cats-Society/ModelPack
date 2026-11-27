@@ -63,17 +63,19 @@ class StripAnalysis:
                                           for x,y in zip(vs[1:-1],vs[2:])),om.MVector()).normal()
         return om.MVector(self.surface_normals[face])
 
-    def corner(self, row, supports, patch_vertices):
+    def corner(self, row, supports, patch_vertices, section_normal=None):
         # Only support vertices affect membership tests in the corner solvers.
         # A growing strip can reuse its interior sections, but a new support
         # or a newly blocked outgoing vertex must force a fresh calculation.
         faces = tuple(tuple(sorted(supports[side][vertex]))
                       for side, vertex in enumerate((row[0], row[-1])))
         support_vertices = {v for side in faces for f in side for v in self.getPolygonVertices(f)}
-        key = tuple(row), faces, frozenset(support_vertices & patch_vertices)
+        key = (tuple(row), faces, frozenset(support_vertices & patch_vertices),
+               None if section_normal is None else tuple(section_normal))
         if key not in self.sections:
             try:
-                self.sections[key] = _section_corner(row, supports, self, self.points, patch_vertices)
+                self.sections[key] = _section_corner(row, supports, self, self.points, patch_vertices,
+                                                     section_normal=section_normal)
             except ValueError as error:
                 self.sections[key] = str(error)
         result = self.sections[key]
@@ -112,7 +114,7 @@ def _paths(edges, pairs, allow_closed=False):
     return paths
 
 
-def _linear_corner(row, supports, fn, points, patch_vertices):
+def _linear_corner(row, supports, fn, points, patch_vertices, section_normal=None):
     """Intersect outgoing surface directions within the bevel section.
 
     A warped quad has no single supporting plane. Its edge leaving the strip
@@ -128,7 +130,11 @@ def _linear_corner(row, supports, fn, points, patch_vertices):
                             if v not in patch_vertices)
         if not outgoing:
             return None
-        direction = sum(((points[v]-points[vertex]).normal() for v in sorted(outgoing)),om.MVector())
+        vectors = [points[v]-points[vertex] for v in sorted(outgoing)]
+        if section_normal is not None:
+            vectors = [v-section_normal*(v*section_normal) for v in vectors]
+            vectors = [v for v in vectors if v.length()>1e-10]
+        direction = sum((v.normal() for v in vectors),om.MVector())
         if direction.length()<1e-8:
             return None
         directions.append(direction.normal())
@@ -273,7 +279,7 @@ def _planar_corner(row, supports, fn, points, patch_vertices):
     return center
 
 
-def _section_corner(row, supports, fn, points, patch_vertices):
+def _section_corner(row, supports, fn, points, patch_vertices, section_normal=None):
     if len(row)>=2:
         normals=[]
         for side,vertex in enumerate((row[0],row[-1])):
@@ -287,7 +293,7 @@ def _section_corner(row, supports, fn, points, patch_vertices):
             normals.append(n.normal())
         try:
             center = (fn.arc(row) if isinstance(fn,StripAnalysis) else _arc_corner(row,points)) if normals[0]*normals[1]<-.95 else None
-            if center is None:center = _linear_corner(row,supports,fn,points,patch_vertices)
+            if center is None:center = _linear_corner(row,supports,fn,points,patch_vertices,section_normal)
         except ValueError:
             center = fn.arc(row) if isinstance(fn,StripAnalysis) else _arc_corner(row,points)
             if center is None:raise
@@ -295,7 +301,7 @@ def _section_corner(row, supports, fn, points, patch_vertices):
     try:
         return _planar_corner(row,supports,fn,points,patch_vertices)
     except ValueError:
-        center=_linear_corner(row,supports,fn,points,patch_vertices)
+        center=_linear_corner(row,supports,fn,points,patch_vertices,section_normal)
         if center is None:raise
         return center
 
@@ -353,9 +359,27 @@ def _grid_candidate(rows, closed, pairs, edge_faces, fn, points, blocked):
                 supports[side].setdefault(vertex, set()).add(outside[0])
     centers = []
     patch_vertices = {v for row in rows for v in row}
-    for row in rows:
-        centers.append(fn.corner(row,supports,patch_vertices) if isinstance(fn,StripAnalysis)
-                       else _section_corner(row,supports,fn,points,patch_vertices))
+    for index,row in enumerate(rows):
+        try:
+            center = (fn.corner(row,supports,patch_vertices) if isinstance(fn,StripAnalysis)
+                      else _section_corner(row,supports,fn,points,patch_vertices))
+        except ValueError:
+            if len(row)!=2:raise
+            # A single-segment chamfer has no intrinsic section plane. On a
+            # bending/warped strip its two outgoing support directions can be
+            # skew in 3D. Use the neighboring section centers to remove the
+            # longitudinal component, keeping the original section endpoints.
+            middle=lambda r:points[r[0]]+(points[r[-1]]-points[r[0]])*.5
+            before=rows[(index-1)%len(rows)] if closed else rows[max(0,index-1)]
+            after=rows[(index+1)%len(rows)] if closed else rows[min(len(rows)-1,index+1)]
+            tangent=middle(after)-middle(before);chord=points[row[-1]]-points[row[0]]
+            if chord*chord<1e-20:raise
+            normal=tangent-chord*((tangent*chord)/(chord*chord))
+            if normal.length()<max(tangent.length()*1e-8,1e-10):raise
+            normal.normalize()
+            center = (fn.corner(row,supports,patch_vertices,normal) if isinstance(fn,StripAnalysis)
+                      else _section_corner(row,supports,fn,points,patch_vertices,normal))
+        centers.append(center)
     average_length = sum(fn.width(row) if isinstance(fn,StripAnalysis) else
                          sum((points[b]-points[a]).length() for a,b in zip(row,row[1:]))
                          for row in rows)/len(rows)
@@ -602,11 +626,12 @@ def _prepare_strips(mesh, face_ids, *, details=None, mesh_fn=None, mesh_points=N
 
 
 def _collapsed_caps(fn, selected, rows):
-    """Terminal fill entirely covered by two collapsing bevel sections.
+    """Terminal fill reduced to at most two vertices by the bevel collapse.
 
     Dissolving support edges can join an end fill directly to both strips.
     Such a face becomes an edge together with the bevel, while every other
-    neighboring face must retain its area and orientation.
+    neighboring face must retain its area and orientation. A terminal fan
+    may also have one fixed root outside a single collapsing section.
     """
     group_for={v:i for i,row in enumerate(rows) for v in row}
     affected=set();vertex=om.MItMeshVertex(fn.dagPath())
@@ -615,7 +640,8 @@ def _collapsed_caps(fn, selected, rows):
     caps=set()
     for face in affected-set(selected):
         vertices=list(fn.getPolygonVertices(face))
-        if all(v in group_for for v in vertices) and len({group_for[v] for v in vertices})<=2:
+        mapped={('row',group_for[v]) if v in group_for else ('vertex',v) for v in vertices}
+        if len(mapped)<=2:
             caps.add(face)
     return caps
 
@@ -761,11 +787,11 @@ def _prepare(mesh, selected, analysis):
             stack.extend(f for f in polygon.getConnectedFaces() if f in selected and f not in patch)
         patches.append(patch)
     centers=[];rows=[];weights=[];used=set();scratch={"fans":[],"regions":[]}
-    from .unbevel_regions import prepare as prepare_regions
+    from .unbevel_regions import prepare as prepare_regions, prepare_quad_network
     from .unbevel_triangles import prepare as prepare_triangles
     for patch in patches:
         local={};failures=[]
-        for recognizer in (_prepare_strips,prepare_regions,prepare_triangles,_prepare_with_caps):
+        for recognizer in (_prepare_strips,prepare_regions,prepare_triangles,_prepare_with_caps,prepare_quad_network):
             try:
                 if recognizer in (_prepare_strips,_prepare_with_caps):
                     result=recognizer(mesh,patch,details=local,analysis=analysis)

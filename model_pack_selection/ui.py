@@ -3,7 +3,7 @@ from maya import cmds,mel
 from maya.api import OpenMaya as om,OpenMayaUI as omui
 from model_pack_bevel.session import without_undo
 from slide_for_maya.core import _mesh_fn
-from . import core
+from . import core,path_mode,repeat
 
 CONTEXT="modelPackSelectionRegionContext"
 _BOUNDARIES={}
@@ -46,20 +46,60 @@ def targets(*,faces_only=False):
     return result
 
 
-def _apply(results,title):
+def _apply(results,title,*,kind='face'):
     """All targets are preflighted before one native, undoable selection."""
     cmds.undoInfo(openChunk=True,chunkName=title)
     try:
         cmds.selectMode(component=True)
-        cmds.selectType(allComponents=False);cmds.selectType(polymeshFace=True)
+        masks={'vertex':'polymeshVertex','edge':'polymeshEdge','face':'polymeshFace'}
+        cmds.selectType(allComponents=False);cmds.selectType(**{masks[kind]:True})
         parents=[]
         for mesh in results:
             path=_mesh_fn(mesh).dagPath();path.pop();parents.append(path.fullPathName())
         cmds.hilite(parents,replace=True)
-        faces=[mesh+f".f[{f}]" for mesh,ids in results.items() for f in sorted(ids)]
+        suffix={'vertex':'vtx','edge':'e','face':'f'}[kind]
+        faces=[mesh+f".{suffix}[{f}]" for mesh,ids in results.items() for f in sorted(ids)]
         if faces:cmds.select(faces,replace=True)
         else:cmds.select(clear=True)
     finally:cmds.undoInfo(closeChunk=True)
+
+
+def path_targets():
+    message='Path: выберите ровно две вершины, два ребра или два полигона одного меша.'
+    items=om.MGlobal.getActiveSelectionList();target=None;kind=None;ids=set()
+    kinds={om.MFn.kMeshVertComponent:'vertex',om.MFn.kMeshEdgeComponent:'edge',om.MFn.kMeshPolygonComponent:'face'}
+    for index in range(items.length()):
+        try:dag,component=items.getComponent(index)
+        except RuntimeError:raise ValueError(message) from None
+        if component.isNull() or not dag.node().hasFn(om.MFn.kMesh) or component.apiType() not in kinds:
+            raise ValueError(message)
+        name=dag.fullPathName();current=kinds[component.apiType()]
+        if target is not None and (name!=target or kind!=current):raise ValueError(message)
+        target=name;kind=current;ids.update(om.MFnSingleIndexedComponent(component).getElements())
+    if len(ids)!=2:raise ValueError(message)
+    return target,kind,sorted(ids)
+
+
+def path():
+    try:
+        mesh,kind,(start,end)=path_targets()
+        selected=core.shortest_path(_mesh_fn(mesh),kind,start,end)
+        # Failed/ambiguous requests leave selection, context and Undo intact.
+        shutdown()
+        _apply({mesh:selected},'Selection Path',kind=kind)
+        return True
+    except (ValueError,RuntimeError) as error:
+        cmds.warning('Выделение: '+str(error));return False
+
+
+def toggle_path(window):
+    if path_mode.enabled():path_mode.shutdown();return False
+    shutdown()
+    if cmds.currentCtx() not in path_mode.NATIVE_CONTEXTS:cmds.setToolTo('selectSuperContext')
+    return path_mode.enable(window)
+
+
+def path_enabled():return path_mode.enabled()
 
 
 def grow(*,shrink=False,modifiers=None):
@@ -68,6 +108,13 @@ def grow(*,shrink=False,modifiers=None):
     try:
         modifiers=cmds.getModifiers() if modifiers is None else modifiers
         if modifiers&4 and modifiers&1:raise ValueError("Ctrl — широкое направление, Shift — узкое. Зажмите один из них.")
+        kind,components=periodic_targets() if cmds.filterExpand(selectionMask=(31,32)) else (None,{})
+        if kind in ('vertex','edge'):
+            _reset_growth()
+            results={mesh:repeat.grow_components(core.Mesh(mesh),ids,kind,shrink=shrink,
+                     narrow=bool(modifiers&1) if modifiers&5 else None) for mesh,ids in components.items()}
+            _apply(results,'Selection shrink' if shrink else 'Selection grow',kind=kind)
+            return True
         if not modifiers&5:
             _reset_growth()
             # Use the same traversal as Maya's PolySelectTraverse, restoring
@@ -109,12 +156,36 @@ def grow(*,shrink=False,modifiers=None):
         cmds.warning("Выделение: "+str(error));return False
 
 
+def periodic_targets():
+    result={};kind=None
+    kinds={om.MFn.kMeshVertComponent:'vertex',om.MFn.kMeshEdgeComponent:'edge',om.MFn.kMeshPolygonComponent:'face'}
+    # A single Maya selection entry can contain both face and edge components
+    # on one DAG object; getComponent alone exposes only one of those types.
+    # Resolve its serialized component ranges separately before choosing a kind.
+    names=om.MGlobal.getActiveSelectionList().getSelectionStrings()
+    for name in names:
+        try:
+            item=om.MSelectionList();item.add(name);path,component=item.getComponent(0)
+        except RuntimeError:raise ValueError('Выберите группу полигонов, рёбер или вершин.') from None
+        if component.isNull() or component.apiType() not in kinds:raise ValueError('Выберите группу полигонов, рёбер или вершин.')
+        current=kinds[component.apiType()]
+        if kind is not None and current!=kind:raise ValueError('Выберите один тип компонентов: полигоны, рёбра или вершины.')
+        kind=current
+        if path.node().hasFn(om.MFn.kTransform):path.extendToShape()
+        if not path.node().hasFn(om.MFn.kMesh):raise ValueError('Для повторения нужны компоненты полигонального меша.')
+        fn=om.MFnMesh(path);indices=om.MFnSingleIndexedComponent(component)
+        ids=range({'vertex':fn.numVertices,'edge':fn.numEdges,'face':fn.numPolygons}[kind]) if indices.isComplete else indices.getElements()
+        result.setdefault(path.fullPathName(),set()).update(ids)
+    if not result or not any(result.values()):raise ValueError('Выберите группу полигонов, рёбер или вершин.')
+    return kind,result
+
+
 def periodic(*,across=False,skip=1):
-    shutdown()
     try:
-        results={mesh:core.periodic(core.Mesh(mesh),faces,across=across,skip=skip)
-                 for mesh,faces in targets(faces_only=True).items()}
-        _apply(results,"Selection every N polygons")
+        kind,selection=periodic_targets();operation={'edge':repeat.edges,'face':repeat.faces,'vertex':repeat.vertices}[kind]
+        results={mesh:operation(core.Mesh(mesh),ids,across=across,skip=skip) for mesh,ids in selection.items()}
+        shutdown()
+        _apply(results,"Selection repeat groups",kind=kind)
         return True
     except (ValueError,RuntimeError) as error:
         cmds.warning("Выделение: "+str(error));return False
@@ -125,6 +196,7 @@ def active():return cmds.currentCtx()==CONTEXT
 
 def activate_region():
     global _BOUNDARIES,_IDENTITIES
+    path_mode.shutdown()
     _reset_growth()
     if active():shutdown();return False
     cmds.setToolTo("selectSuperContext")
@@ -204,6 +276,8 @@ def _finalize():
 
 
 def shutdown(*,clear_growth=True):
+    path_mode.shutdown()
     if active():cmds.setToolTo("selectSuperContext")
     _finalize()
     if clear_growth:_reset_growth()
+

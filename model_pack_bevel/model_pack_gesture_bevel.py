@@ -11,9 +11,10 @@ _root = str(Path(globals().get("__file__",sys._getframe().f_code.co_filename)).r
 if _root not in sys.path:
     sys.path.insert(0,_root)
 from maya.api import OpenMaya as om
-from model_pack_bevel.geometry import TemplateGeometry
+from model_pack_bevel.geometry import TemplateGeometry, clean_sharp_template
 from model_pack_bevel.graph import EdgeGraph
 from model_pack_bevel.profiles import Curve
+from model_pack_bevel.surface import append_rim_caps
 
 NODE_NAME = "modelPackGestureBevel"
 NODE_ID = om.MTypeId(0x0013B2F1)
@@ -107,19 +108,41 @@ class GestureBevelNode(om.MPxNode):
         rounded = data.inputValue(cls.roundMesh).asMesh()
         if source.isNull() or flat.isNull() or rounded.isNull():
             return
-        fn_source, fn_flat, fn_round = (om.MFnMesh(mesh) for mesh in (source, flat, rounded))
         matrix = data.inputValue(cls.meshMatrix).asMatrix()
+        fn = om.MFnDependencyNode(self.thisMObject())
+        meta = json.loads(data.inputValue(fn.attribute("sessionMeta")).asString()) if fn.hasAttribute("sessionMeta") else {}
+        sharp = meta.get("sharp", False)
+        round_supports = meta.get("round_supports", 0) if not sharp else 0
+        round_side_contacts = meta.get("round_side_contacts", False) and not sharp
+        corner_grids = meta.get("corner_grids", False)
+        preserve_open_rim = meta.get("preserve_open_rim", False)
+        if not sharp and meta.get('junction_fill',False) and fn.hasAttribute('junctionFlat') and fn.hasAttribute('junctionRound'):
+            first=data.inputValue(fn.attribute('junctionFlat')).asMesh();second=data.inputValue(fn.attribute('junctionRound')).asMesh()
+            if not first.isNull() and not second.isNull():flat,rounded=first,second
+        fn_source, fn_flat, fn_round = (om.MFnMesh(mesh) for mesh in (source, flat, rounded))
         key = (om.MObjectHandle(source).hashCode(),om.MObjectHandle(flat).hashCode(),
                om.MObjectHandle(rounded).hashCode(),fn_flat.numVertices,fn_round.numVertices,
-               tuple(matrix),data.inputValue(cls.segments).asInt())
+               tuple(matrix),bool(meta.get('junction_fill',False)),sharp,
+               bool(meta.get("clean_template")),round_supports,round_side_contacts,corner_grids,
+               preserve_open_rim,data.inputValue(cls.segments).asInt())
         if self._template is None or key != self._key:
             points = fn_source.getPoints()
-            flat_points, round_points = fn_flat.getPoints(), fn_round.getPoints()
             selected = json.loads(data.inputValue(cls.selectedEdges).asString())
             reference = data.inputValue(cls.referenceWidth).asDouble()
+            if sharp and meta.get("clean_template"):
+                flat = clean_sharp_template(flat, matrix, reference)
+                fn_flat = fn_round = om.MFnMesh(flat)
+            flat_points, round_points = fn_flat.getPoints(), fn_round.getPoints()
             graph = EdgeGraph(points, ((e, fn_source.getEdgeVertices(e)) for e in selected))
+            blends=json.loads(data.inputValue(fn.attribute('junctionBlends')).asString() or '{}') if not sharp and meta.get('junction_fill') and fn.hasAttribute('junctionBlends') else {}
             self._template = TemplateGeometry(points, flat_points, round_points, graph, reference, matrix,
-                                              fn_flat.getVertices(),fn_flat.getTriangles())
+                                              fn_flat.getVertices(),fn_flat.getTriangles(),blends,sharp=sharp,
+                                              round_supports=round_supports,segments=key[-1],
+                                              round_side_contacts=round_side_contacts,corner_grids=corner_grids,
+                                              source_topology=fn_source.getVertices() if preserve_open_rim else None)
+            self._template_mesh=om.MFnMeshData().create()
+            cached = om.MFnMesh(om.MFnMesh().copy(flat,self._template_mesh))
+            self._rim_cap_points = append_rim_caps(cached, fn_source, self._template.rim_caps)
             self._key = key
             self._limits = None
         weights = {int(k): v for k, v in json.loads(data.inputValue(cls.widthWeights).asString()).items()}
@@ -137,15 +160,42 @@ class GestureBevelNode(om.MPxNode):
                 self._limits[int(vertex)] = limit
             self._limit_text = limit_text
         curve = Curve(tuple(tuple(p) for p in json.loads(data.inputValue(cls.profileCurve).asString())), False)
-        fn = om.MFnDependencyNode(self.thisMObject())
-        meta = json.loads(data.inputValue(fn.attribute("sessionMeta")).asString()) if fn.hasAttribute("sessionMeta") else {}
-        positions = self._template.evaluate(data.inputValue(cls.width).asDouble(),
-                                            data.inputValue(cls.shape).asDouble(), weights, self._limits,
-                                            data.inputValue(cls.profileKind).asString(), curve,meta.get("keep_equal",True))
+        width = data.inputValue(cls.width).asDouble()
+        spacing = meta.get("support_spacing")
+        ratio = (meta.get("support_percent") or 0.) / 100.
+        step = width * ratio if spacing is None else spacing
+        if sharp:
+            positions = self._template.evaluate_sharp(width, weights,
+                meta.get("support_edges", 0) if step else 0, step, meta.get("keep_equal", True),
+                fn_source.getVertices(), meta.get("preserve_rails", False), meta.get("clean_template", False),
+                local_width_limits=meta.get("local_width_limits", False),
+                corner_grids=corner_grids)
+            self._template.reported_width = self._template.effective_width
+        else:
+            positions = self._template.evaluate(width + round_supports * step, data.inputValue(cls.shape).asDouble(), weights, self._limits,
+                data.inputValue(cls.profileKind).asString(), curve, meta.get("keep_equal", True))
+            self._template.reported_width = self._template.effective_width
+            if round_supports and width > 1e-9:
+                extent = self._template.effective_width
+                if spacing is None:
+                    fitted_width = extent / (1. + round_supports * ratio)
+                    step = fitted_width * ratio
+                else:
+                    fitted_width = extent - round_supports * step
+                self._template.reported_width = max(0., fitted_width)
+                positions = self._template.fit_rounded_supports(positions, round_supports, step)
+            if preserve_open_rim:
+                positions = self._template.preserve_rounded_surface(positions)
+                for point in self._rim_cap_points:
+                    positions.append(point)
         output = om.MFnMeshData().create()
         result = om.MFnMesh()
-        result.copy(flat, output)
+        result.copy(self._template_mesh, output)
         result.setPoints(positions)
+        self._template.apply_edge_smoothing(result, fn_source, multi=not sharp and key[-1]>1, sharp=sharp)
+        self._welded_faces = None
+        if sharp and meta.get("weld_contacts"):
+            self._welded_faces = self._template.weld_sharp_contacts(result)
         data.outputValue(cls.outputMesh).setMObject(output)
         data.setClean(plug)
 
@@ -153,6 +203,8 @@ class GestureBevelNode(om.MPxNode):
         cls = type(self)
         if om.MFnAttribute(plug.attribute()).name=="sessionMeta":
             affected.append(om.MPlug(self.thisMObject(),cls.outputMesh))
+        if om.MFnAttribute(plug.attribute()).name in ('junctionFlat','junctionRound','junctionBlends'):
+            self._template=None;self._key=None;affected.append(om.MPlug(self.thisMObject(),cls.outputMesh))
         if plug.attribute() in (cls.sourceMesh,cls.flatMesh,cls.roundMesh,
                                 cls.meshMatrix,cls.selectedEdges,cls.referenceWidth):
             self._template = None
